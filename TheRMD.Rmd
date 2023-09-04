@@ -1,6 +1,6 @@
 ---
 title: "Dissertaion RMD: Algorithmn fairness on simulated data"
-author: "Gary (Bangxiang) Guan, UoM"
+author: "Student number: 11041462 UoM"
 date: "`r Sys.Date()`"
 output:
   rmdformats::downcute:
@@ -16,9 +16,7 @@ knitr::opts_chunk$set(cache = TRUE)
 
 This doc is the place I record the R code and its explanation.
 
-[gbx818\@gmail.com](mailto:gbx818@gmail.com){.email}\
-[bangxiang.guan\@postgrad.manchester.ac.uk](mailto:bangxiang.guan@postgrad.manchester.ac.uk){.email}\
-\* +44 7307942311
+hide my email.
 
 # Load Package
 
