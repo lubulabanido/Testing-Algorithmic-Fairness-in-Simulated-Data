@@ -1,0 +1,2908 @@
+---
+title: "Dissertaion RMD: Algorithmn fairness on simulated data"
+author: "Gary (Bangxiang) Guan, UoM"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::downcute:
+    self_contained: true
+    default_style: "light"
+    downcute_theme: "default"
+---
+
+```{r setup, include=FALSE}
+## Global options
+knitr::opts_chunk$set(cache = TRUE)
+```
+
+This doc is the place I record the R code and its explanation.
+
+[gbx818\@gmail.com](mailto:gbx818@gmail.com){.email}\
+[bangxiang.guan\@postgrad.manchester.ac.uk](mailto:bangxiang.guan@postgrad.manchester.ac.uk){.email}\
+\* +44 7307942311
+
+# Load Package
+
+```{r, message=FALSE}
+library(caret)  # for data partitioning and confusion matrix
+library(ROSE)  # for oversampling
+library(ggplot2)  # for plotting
+library(gridExtra)
+library("mlr3")
+library("mlr3fairness")
+library(bestNormalize)# YOE
+library(pROC)
+library(glmnet)# lasso
+library(keras) # auto-encoding
+library(dplyr)
+library(kableExtra)# generating tables in RMD
+library(reshape2)
+library(DMwR) # Required for SMOTE function #remotes::install_github("cran/DMwR") 
+library(xtable)# generate latex
+```
+
+# Initialize data
+
+We divide the data into train and test sets (7:3)\
+
+```{r}
+data("compas", package = "mlr3fairness")
+data<-compas
+data <- na.omit(data)
+rawdata<-data
+# delete the is_recid avoiding correlation
+data<- subset(data, select = -is_recid)
+table(data$two_year_recid)
+set.seed(123)  # setting seed to reproduce results of random sampling
+trainingIndex <- createDataPartition(data$two_year_recid, p = 0.7, list = FALSE)
+trainingData <- data[trainingIndex, ]  # create training set
+testData <- data[-trainingIndex, ]     # create test set
+```
+
+# Explore the reasons of the unfairness:
+
+## Unbalanced data set (variables)
+
+```{r}
+summary(trainingData)
+# Extract column names from trainingData
+colnames_df <- data.frame(Column_Names = colnames(trainingData))
+
+# Load xtable package and convert to LaTeX
+library(xtable)
+latex_table_colnames <- xtable(colnames_df, caption="Column Names of trainingData")
+print(latex_table_colnames, type="latex", table.placement="ht")
+
+pie(table(trainingData$race),main = "race")
+pie(table(trainingData$sex),main="sex")
+pie(table(trainingData$two_year_recid),main="two_year_recid")
+# Create a histogram for decile_score where race is African-American and Caucasian
+ggplot(subset(trainingData, race == "African-American"), aes(x = decile_score)) +
+  geom_histogram(binwidth = 1, color = "black", fill = "lightblue") +
+  labs(x = "Decile Score", y = "Count", title = "Histogram of Decile Score for African-American Race")
+
+ggplot(subset(trainingData, race == "Caucasian"), aes(x = decile_score)) +
+  geom_histogram(binwidth = 1, color = "black", fill = "lightblue") +
+  labs(x = "Decile Score", y = "Count", title = "Histogram of Decile Score for Caucasian Race")
+
+
+
+```
+
+In train [[data:\\\\](data:\){.uri}]([data:\\](data:)%7B.uri%7D){.uri}
+
+The decile score shows the unfairness in races. The age_cat is obvious not necessary for there is age information. We should delete them. 
+
+
+```{r}
+# delete the decile_score , score text and age_cat avoiding correlation
+data<- subset(data, select = -decile_score)
+data<- subset(data, select = -score_text)
+data<- subset(data, select = -age_cat)
+table(data$two_year_recid)
+```
+
+
+Reset the training and testing data.
+```{r}
+
+set.seed(123)  # setting seed to reproduce results of random sampling
+trainingIndex <- createDataPartition(data$two_year_recid, p = 0.7, list = FALSE)
+trainingData <- data[trainingIndex, ]  # create training set
+testData <- data[-trainingIndex, ]     # create test set
+summary(trainingData)
+```
+
+Also for
+> https://freecontent.manning.com/bias-and-fairness-in-machine-learning-part-3-building-a-bias-aware-model/
+
+We can make a power transform: using the Yeo-Johnson transformer to treat the disparate impact in training data and get the parametre $\lambda$s of the transform.
+
+```{r}
+
+# Identify numeric variables
+numeric_vars <- names(data)[sapply(trainingData, is.numeric)]
+
+# Exclude the 'two_year_recid' variable
+numeric_vars <- setdiff(numeric_vars, "two_year_recid")
+
+# Create an empty list to store the lambda values for each variable
+lambdas <- list()
+# Apply the Yeo-Johnson transformation
+for (var in numeric_vars) {
+  transformed <- yeojohnson(trainingData[[var]])
+  trainingData[[var]] <- transformed$x.t
+  lambdas[[var]] <- transformed$lambda
+}
+
+# Check the updated data
+summary(trainingData)
+lambdas
+
+# Apply the transformation to the test data:
+# Function to apply Yeo-Johnson transformation given a lambda value
+apply_yeojohnson <- function(x, lambda) {
+  if (lambda == 0) {
+    return(log(x + 1))
+  } else if (x >= 0) {
+    return(((x + 1) ^ lambda - 1) / lambda)
+  } else {
+    return(-((-x + 1) ^ lambda - 1) / lambda)
+  }
+}
+
+for (var in numeric_vars) {
+  testData[[var]] <- sapply(testData[[var]], apply_yeojohnson, lambda = lambdas[[var]])
+}
+
+summary(testData)
+
+```
+
+
+
+
+Since the race and sex are sensitive attributes, we explore their distribution and find that the data set in unbalanced. (The Y is quiet balanced.)\
+
+> The issue with an unbalanced dataset is that model parameters can become skewed towards the majority. For example, the trends could be different for the female and male populations. By trends, we mean relationships between features and the target variable. A model will try to maximise accuracy across the entire population. In doing so it may favour trends in the male population. As a consequence, we can have a lower accuracy on the female population. <https://towardsdatascience.com/analysing-fairness-in-machine-learning-with-python-96a9ab0d0705>
+
+## Prevalence
+
+See if the protected variables (race and sex) and Y have prevalence.
+
+```{r}
+#Calculate prevelance
+table(trainingData$race,trainingData$two_year_recid)
+table(trainingData$sex,trainingData$two_year_recid)
+```
+
+In this data, we find that female are less likely to get a two_year_recid. And African-America are more likely to get a two_year_recid than other races.\
+We can also do some proxy variables explorations after this.
+
+# Contingency table
+
+In this part, we want to see if race is significant relates to two_year_recid.
+
+## Chi test
+
+```{R}
+
+plot <- ggplot(trainingData, aes(x = race, fill = as.factor(two_year_recid))) +
+  geom_bar(position = "dodge") +
+  labs(x = "Race",
+       y = "Count",
+       fill = "Two Year Recidivism",
+       title = "Distribution of Two Year Recidivism by Race") +
+  theme_minimal()
+
+# Display the plot
+print(plot)
+# Create the contingency table
+contingency_table <- table(trainingData$race, trainingData$two_year_recid)
+
+# Perform the chi-squared test
+chi_squared_test <- chisq.test(contingency_table)
+
+# Print the results
+print(chi_squared_test)
+
+```
+
+So the result showes that there is a significant relationship of race and two_year_recid.
+
+# Logistic Regression:
+
+In the LR model, we no longer care about the model interpretation. We only care about the model performance which is accuracy, sensitivity, specificity and best threshold.
+
+# LR: Making biases: Add noises(Swithch 0 & 1) to Y $(Y=\beta X+e)$
+
+Set the function
+
+## Function A: make random noises (abandoned)
+
+```{r}
+## Making the biases
+## add noise to the Y  $(Y=\beta X+e)$
+#### set up the function
+noisize <- function(data, columnName, p) {
+  if (!columnName %in% colnames(data)) {
+    stop("Specified column '", columnName, "' does not exist in the dataframe.")
+  }
+  column <- data[[columnName]]
+  n <- length(column)
+  
+  if (p < 0 || p > 100) {
+    stop("Percentage 'p' should be between 0 and 100 (inclusive).")
+  }
+  # Calculate the number of elements to randomize
+  numRandomize <- round(n * (p / 100))
+  # Randomize the indices of the elements to be shuffled
+  randomIndices <- sample(n, numRandomize)
+  # Shuffle the selected elements
+  shuffledElements <- sample(column[randomIndices])
+  # Assign the shuffled elements back to the selected indices
+  column[randomIndices] <- shuffledElements
+  # Assign the modified column back to the data frame
+  data[[columnName]] <- column
+  return(data)
+}
+```
+
+## Function B (random negative): x(-1) the column in a proportion
+
+We use this function in the PCA part .
+
+```{r}
+random_negative <- function(df, column_name, proportion_censor) {
+  proportion_censor<-proportion_censor/100
+  # Step 1: Check if the specified proportion is within a valid range
+  if (proportion_censor < 0 || proportion_censor > 1) {
+    stop("Proportion of censoring must be between 0 and 1 (inclusive).")
+  }
+  
+  # Step 2: Calculate the number of rows to censor values for
+  num_rows_censor <- round(nrow(df) * proportion_censor)
+  
+  # Step 3: Generate random row indices for censoring values
+  set.seed(42)  # Set seed for reproducibility (you can change the seed value)
+  rows_to_censor <- sample(1:nrow(df), num_rows_censor)
+  
+  # Step 4: Censor the values for the selected rows
+  df[[column_name]][rows_to_censor] <- - df[[column_name]][rows_to_censor]
+  
+  return(df)
+}
+```
+
+## Function C (noisy_swap): swap the outcome in a proportion
+
+> Made Changes: As talked before, there seems to be a bug where instead of zeros the code is changed to NANs, which breaks the dataset.
+
+```{r}
+noisy_swap <- function(df, outcome_column, proportion_noise) {#proportion_noise should be in [0,100]
+  # Step 1: Find unique values in the outcome column
+  unique_values <- unique(df[[outcome_column]])
+  
+  # Step 2: Identify positive and negative classes (for binary classification)
+  if (length(unique_values) == 2) {
+    positive_class <- unique_values[2]
+    negative_class <- unique_values[1]
+  } else {
+    stop("noisy_swap function is designed for binary classification (2 unique values).")
+  }
+  
+  # Step 3: Calculate the number of rows to add noise to
+  num_rows_noise <- round(nrow(df) * proportion_noise/100)
+  
+  # Step 4: Generate random row indices for adding noise
+  set.seed(42)  # Set seed for reproducibility (you can change the seed value)
+  rows_to_add_noise <- sample(1:nrow(df), num_rows_noise)
+  
+  # Step 5: Add noise by swapping values for the selected rows
+  ### OLD CODE
+  #df[[outcome_column]][rows_to_add_noise] <- ifelse(
+  #  df[[outcome_column]][rows_to_add_noise] == positive_class,
+  #  negative_class,
+  #  positive_class
+  #)
+  ### NEW CODE
+  df[[outcome_column]][rows_to_add_noise] <- ifelse(
+    df[[outcome_column]][rows_to_add_noise] == positive_class,
+    0,
+    1
+  )
+  
+  return(df)
+}
+
+# Example usage:
+# Assuming your dataframe is 'df' with the outcome column 'Y'
+# Add 10% noise to the 'Y' column
+# df <- noisy_swap(df, "Y", proportion_noise = 0.1)
+```
+
+## Use Function C
+Now we imply the model to different p (proportion of noises in Y) and get the model performance (model results).\
+
+> Made Changes: The roc function automatically identifies which class is the positive one, which leads to some problems when the model is really bad.
+
+```{r,message=FALSE,warning=FALSE}
+### make noises in y
+# Load required library
+library(pROC)
+# Empty vectors to store results
+p_values <- seq(0, 100, 2)  # Range of p values from 0 to 100 with a step of 5
+model_results <- data.frame()
+
+# Iterate over p values
+for (p in p_values) {
+  # Apply noise to the column
+  trainingData_noise_y <- noisy_swap(trainingData, "two_year_recid", p)
+  
+  # Fit the logistic regression model
+  model <- glm(two_year_recid ~ ., family = binomial(link = 'logit'), data = trainingData_noise_y)
+  
+  # Make predictions on the test data.
+  probabilities <- predict(model, newdata = testData, type = "response")
+  
+  # Generate ROC curve
+  ### OLD CODE
+  #roc_obj <- roc(response = testData$two_year_recid, predictor = probabilities)
+  #specificity<-coords(roc_obj, "best")$specificity[1]
+  #sensitivity<-coords(roc_obj, "best")$sensitivity[1]
+  ### NEW CODE
+  roc_obj <- roc(response = testData$two_year_recid, predictor = probabilities, levels = c(0,1), direction = "<")
+  specificity<-coords(roc_obj, "best")$specificity[1]
+  sensitivity<-coords(roc_obj, "best")$sensitivity[1]
+  # Find the best threshold
+  best_threshold <- coords(roc_obj, "best")$threshold[1]
+  
+  # Classify predictions based on the best threshold
+  predictions <- ifelse(probabilities > best_threshold, 1, 0)
+  
+  # Calculate accuracy
+  cm <- confusionMatrix(factor(predictions), factor(testData$two_year_recid))
+  best_accuracy <- sum(diag(cm$table)) / sum(cm$table)
+  
+  ### NEW CODE
+  # If threshold is minus infinity (useless model), we change it to Nan
+  # for plotting
+  if (best_threshold == -Inf) {
+    threshold <- NaN
+    best_accuracy <- NaN
+    specificity <- NaN
+    sensitivity <- NaN
+    auc <- NaN
+  }
+  
+   # for plotting
+  if (best_threshold == Inf) {
+    threshold <- NaN
+    best_accuracy <- NaN
+    specificity <- NaN
+    sensitivity <- NaN
+    auc <- NaN
+  }
+  # Store model results
+  model_result <- data.frame(p = p, threshold = best_threshold, accuracy = best_accuracy,specificity=specificity,sensitivity=sensitivity,auc=auc(roc_obj))
+  model_results <- rbind(model_results, model_result)
+}
+
+```
+
+Now we plot the model result:\
+
+```{r}
+# Plot the changes in model_result
+par(mfrow = c(2, 3))
+plot(model_results$p, model_results$accuracy, type = "o", xlab = "proportion of noise in Y", ylab = "Accuracy", main = "Accuracy vs. p")
+plot(model_results$p, model_results$sensitivity, type = "o", xlab = "proportion of noise in Y", ylab = "sensitivity", main = "sensitivity vs. p")
+plot(model_results$p, model_results$specificity, type = "o", xlab = "proportion of noise in Y", ylab = "specificity", main = "specificity vs. p")
+plot(model_results$p, model_results$auc, type = "o", xlab = "proportion of noise in Y", ylab = "best treshold", main = "auc vs. p")
+plot(model_results$p, model_results$threshold, type = "o", xlab = "proportion of noise in Y", ylab = "best treshold", main = "best threshold vs. p")
+par(mfrow = c(1, 1))
+```
+
+When there is no damage over Y, the model result and the logistic model is:\
+
+```{r}
+model_results[1,]
+
+trainingData$race <- relevel(trainingData$race, ref = "Other")
+model <- glm(two_year_recid ~ ., family = binomial(link = 'logit'), data = trainingData)
+summary(model)
+
+```
+
+We can see that in logistic regression model, race is not significant.\
+
+## Function D: Reduce Positive cases (change pos into neg)
+
+** Description of reduce_positive_noise Function**
+
+*Purpose:\
+The reduce_positive_noise function is designed to introduce noise into a binary outcome variable by reducing the prevalence of the positive class. This is achieved by converting a specified proportion of the positive instances to the negative class, while keeping the negative instances unchanged.
+
+* Design:
+The function operates on the premise that, in certain applications, it might be necessary to simulate scenarios where the positive class occurrences are artificially reduced to examine the robustness of models or to understand the impact of data quality. The function allows the user to specify the positive class and the desired proportion of noise. It then randomly selects the specified proportion of positive instances and converts them to the negative class.
+
+* Parameters:
+
+1. df: The dataframe containing the outcome variable to which noise will be introduced.
+2. outcome_column: The name of the binary outcome column in the dataframe.
+3. positive_class: The value in the outcome_column that is considered the positive class. This is the class whose prevalence will be reduced.
+4. proportion_noise: The proportion (in percentage) of positive instances that will be converted to the negative class. This proportion is applied to the entire dataset, not just the positive instances.
+
+* Checks and Constraints:
+
+The function ensures that the outcome variable is binary.
+A check is included to ensure that the positive_class specified is one of the two unique values in the outcome_column.\
+The function calculates the maximum feasible noise proportion based on the prevalence of the positive class in the dataset. If the user specifies a noise proportion exceeding this maximum, the function throws an error.\
+
+* Usage Example:
+To convert 10% of the positive instances in the 'Y' column of a dataframe 'df' (where '1' is considered positive) to the negative class, you would use:
+
+R
+```{r}
+#df <- reduce_positive_noise(df, "Y", positive_class = 1, proportion_noise = 10)
+```
+
+* The function:\
+```{r}
+reduce_positive_noise <- function(df, outcome_column, positive_class, proportion_noise) {
+  # proportion_noise should be in [0,100]
+  
+  # Step 1: Identify unique values in the outcome column
+  unique_values <- unique(df[[outcome_column]])
+  
+  # Step 2: Identify positive and negative classes (for binary classification)
+  if (length(unique_values) == 2) {
+    if (!positive_class %in% unique_values) {
+      stop("The provided positive_class is not one of the unique values in the outcome_column.")
+    }
+    negative_class <- setdiff(unique_values, positive_class)[[1]]
+  } else {
+    stop("reduce_positive_noise function is designed for binary classification (2 unique values).")
+  }
+  
+  # Step 3: Calculate the proportion of the positive class in the outcome column
+  total_rows <- nrow(df)
+  num_positives <- sum(df[[outcome_column]] == positive_class)
+  max_proportion_noise <- (num_positives / total_rows) * 100
+  
+  # Step 4: Check if the desired proportion_noise is feasible
+  if (proportion_noise > max_proportion_noise) {
+    proportion_noise <- max_proportion_noise
+  }
+  
+  # Step 5: Calculate the number of positive instances to change to the negative class
+  num_rows_noise <- round(total_rows * proportion_noise/100)
+  
+  # Step 6: Generate random row indices of positive class for introducing noise
+  set.seed(42)  # Set seed for reproducibility (you can change the seed value)
+  rows_to_add_noise <- sample(which(df[[outcome_column]] == positive_class), num_rows_noise)
+  
+  # Step 7: Introduce noise by converting selected positive instances to the negative class
+  df[[outcome_column]][rows_to_add_noise] <- negative_class
+  
+  return(df)
+}
+
+# Example usage:
+# Assuming your dataframe is 'df' with the outcome column 'Y' and you consider '1' as the positive class
+# Convert 10% of the data's positive instances ('1's) to the negative class (keeping negative instances fixed)
+# df <- reduce_positive_noise(df, "Y", positive_class = 1, proportion_noise = 10)
+
+```
+
+## Use Function D, make 1 into 0:
+Same as before:
+Now we imply the model to different p (proportion of noises in Y) and get the model performance (model results).\
+
+> Made Changes: The roc function automatically identifies which class is the positive one, which leads to some problems when the model is really bad.
+
+```{r,message=FALSE,warning=FALSE}
+### make noises in y
+# Load required library
+library(pROC)
+# Empty vectors to store results
+p_values <- seq(0, 100, 2)  # Range of p values from 0 to 100 with a step of 5
+model_results <- data.frame()
+
+# Iterate over p values
+for (p in p_values) {
+  # Apply noise to the column
+  trainingData_noise_y <- reduce_positive_noise(trainingData, "two_year_recid",1, p)
+  
+  # Fit the logistic regression model
+  model <- glm(two_year_recid ~ ., family = binomial(link = 'logit'), data = trainingData_noise_y)
+  
+  # Make predictions on the test data.
+  probabilities <- predict(model, newdata = testData, type = "response")
+  
+  # Generate ROC curve
+  ### OLD CODE
+  #roc_obj <- roc(response = testData$two_year_recid, predictor = probabilities)
+  #specificity<-coords(roc_obj, "best")$specificity[1]
+  #sensitivity<-coords(roc_obj, "best")$sensitivity[1]
+  ### NEW CODE
+  roc_obj <- roc(response = testData$two_year_recid, predictor = probabilities, levels = c(0,1), direction = "<")
+  specificity<-coords(roc_obj, "best")$specificity[1]
+  sensitivity<-coords(roc_obj, "best")$sensitivity[1]
+  # Find the best threshold
+  best_threshold <- coords(roc_obj, "best")$threshold[1]
+  auc_here<-auc(roc_obj)
+  # Classify predictions based on the best threshold
+  predictions <- ifelse(probabilities > best_threshold, 1, 0)
+  
+  # Calculate accuracy
+  cm <- confusionMatrix(factor(predictions), factor(testData$two_year_recid))
+  best_accuracy <- sum(diag(cm$table)) / sum(cm$table)
+  
+  ### NEW CODE
+  # If threshold is minus infinity (useless model), we change it to Nan
+  # for plotting
+  if (best_threshold == -Inf) {
+    threshold <- NaN
+    best_accuracy <- NaN
+    specificity <- NaN
+    sensitivity <- NaN
+    auc <- NaN
+  }
+  
+   # for plotting
+  if (best_threshold == Inf) {
+    threshold <- NaN
+    best_accuracy <- NaN
+    specificity <- NaN
+    sensitivity <- NaN
+    auc <- NaN
+  }
+  if (best_threshold < 0.0001) {
+    threshold <- NaN
+    best_accuracy <- NaN
+    specificity <- NaN
+    sensitivity <- NaN
+    auc <- NaN
+    best_threshold<-NaN
+    best_accuracy<-NaN
+    auc_here<-NaN
+  }
+  # Store model results
+  model_result <- data.frame(p = p, threshold = best_threshold, accuracy = best_accuracy,specificity=specificity,sensitivity=sensitivity,auc=auc_here)
+  model_results <- rbind(model_results, model_result)
+}
+
+```
+
+Now we plot the model result:\
+
+```{r}
+# Plot the changes in model_result
+par(mfrow = c(2, 3))
+plot(model_results$p, model_results$accuracy, type = "o", xlab = "proportion of noise in Y", ylab = "Accuracy", main = "Accuracy vs. p")
+plot(model_results$p, model_results$sensitivity, type = "o", xlab = "proportion of noise in Y", ylab = "sensitivity", main = "sensitivity vs. p")
+plot(model_results$p, model_results$specificity, type = "o", xlab = "proportion of noise in Y", ylab = "specificity", main = "specificity vs. p")
+plot(model_results$p, model_results$auc, type = "o", xlab = "proportion of noise in Y", ylab = "best treshold", main = "auc vs. p")
+plot(model_results$p, model_results$threshold, type = "o", xlab = "proportion of noise in Y", ylab = "best treshold", main = "best threshold vs. p")
+par(mfrow = c(1, 1))
+```
+
+### show some p=80 result:
+```{r}
+model_results[40,]
+```
+
+
+## Function D’， make 0 into 1:
+Same as before:
+Now we imply the model to different p (proportion of noises in Y) and get the model performance (model results).\
+
+> Made Changes: The roc function automatically identifies which class is the positive one, which leads to some problems when the model is really bad.
+
+```{r,message=FALSE,warning=FALSE}
+### make noises in y
+# Load required library
+library(pROC)
+# Empty vectors to store results
+p_values <- seq(0, 100, 2)  # Range of p values from 0 to 100 with a step of 5
+model_results <- data.frame()
+
+# Iterate over p values
+for (p in p_values) {
+  # Apply noise to the column
+  trainingData_noise_y <- reduce_positive_noise(trainingData, "two_year_recid",0, p) # change the positive parameter here 0 or 1
+  
+  # Fit the logistic regression model
+  model <- glm(two_year_recid ~ ., family = binomial(link = 'logit'), data = trainingData_noise_y)
+  
+  # Make predictions on the test data.
+  probabilities <- predict(model, newdata = testData, type = "response")
+  
+  # Generate ROC curve
+  ### OLD CODE
+  #roc_obj <- roc(response = testData$two_year_recid, predictor = probabilities)
+  #specificity<-coords(roc_obj, "best")$specificity[1]
+  #sensitivity<-coords(roc_obj, "best")$sensitivity[1]
+  ### NEW CODE
+  roc_obj <- roc(response = testData$two_year_recid, predictor = probabilities, levels = c(0,1), direction = "<")
+  specificity<-coords(roc_obj, "best")$specificity[1]
+  sensitivity<-coords(roc_obj, "best")$sensitivity[1]
+  # Find the best threshold
+  best_threshold <- coords(roc_obj, "best")$threshold[1]
+  auc_here<-auc(roc_obj)
+  # Classify predictions based on the best threshold
+  predictions <- ifelse(probabilities > best_threshold, 1, 0)
+  
+  # Calculate accuracy
+  cm <- confusionMatrix(factor(predictions), factor(testData$two_year_recid))
+  best_accuracy <- sum(diag(cm$table)) / sum(cm$table)
+  
+  ### NEW CODE
+  # If threshold is minus infinity (useless model), we change it to Nan
+  # for plotting
+  if (best_threshold == -Inf) {
+    threshold <- NaN
+    best_accuracy <- NaN
+    specificity <- NaN
+    sensitivity <- NaN
+    auc <- NaN
+  }
+  
+   # for plotting
+  if (best_threshold == Inf) {
+    threshold <- NaN
+    best_accuracy <- NaN
+    specificity <- NaN
+    sensitivity <- NaN
+    auc <- NaN
+  }
+  if (best_threshold < 0.0001) {
+    threshold <- NaN
+    best_accuracy <- NaN
+    specificity <- NaN
+    sensitivity <- NaN
+    auc <- NaN
+    best_threshold<-NaN
+    best_accuracy<-NaN
+    auc_here<-NaN
+  }
+  # Store model results
+   model_result <- data.frame(p = p, threshold = best_threshold, accuracy = best_accuracy,specificity=specificity,sensitivity=sensitivity,auc=auc_here)
+  model_results <- rbind(model_results, model_result)
+}
+
+```
+
+Now we plot the model result:\
+
+```{r}
+# Plot the changes in model_result
+par(mfrow = c(2, 3))
+plot(model_results$p, model_results$accuracy, type = "o", xlab = "proportion of noise in Y", ylab = "Accuracy", main = "Accuracy vs. p")
+plot(model_results$p, model_results$sensitivity, type = "o", xlab = "proportion of noise in Y", ylab = "sensitivity", main = "sensitivity vs. p")
+plot(model_results$p, model_results$specificity, type = "o", xlab = "proportion of noise in Y", ylab = "specificity", main = "specificity vs. p")
+plot(model_results$p, model_results$auc, type = "o", xlab = "proportion of noise in Y", ylab = "best treshold", main = "auc vs. p")
+plot(model_results$p, model_results$threshold, type = "o", xlab = "proportion of noise in Y", ylab = "best treshold", main = "best threshold vs. p")
+par(mfrow = c(1, 1))
+```
+
+
+When there is no damage over Y, the model result and the logistic model is:\
+
+```{r}
+model_results[1,]
+
+trainingData$race <- relevel(trainingData$race, ref = "Other")
+model <- glm(two_year_recid ~ ., family = binomial(link = 'logit'), data = trainingData)
+summary(model)
+
+```
+
+
+
+## Conclusion:
+
+The performance will dramatically become bad from the 80% noises in Y.
+
+# LR without race using noisy_swap
+
+Since the race variable is sensitive, we will explore the LR model without race and see its performance.
+
+The code is same except we delete race in the data
+
+```{r,message=FALSE,warning=FALSE}
+# Empty vectors to store results
+p_values <- seq(0, 100, 2)  # Range of p values from 0 to 100 with a step of 5
+model_results <- data.frame()
+trainingData_norace <- subset(trainingData, select = -race)
+summary(trainingData_norace)
+testData_norace <- subset(testData, select = -race)
+
+# Iterate over p values
+for (p in p_values) {
+  # Apply noise to the column
+  trainingData_noise_y <- noisy_swap(trainingData_norace , "two_year_recid", p)
+  
+  # Fit the logistic regression model
+  model <- glm(two_year_recid ~ ., family = binomial(link = 'logit'), data = trainingData_noise_y)
+  
+  # Make predictions on the test data.
+  probabilities <- predict(model, newdata = testData_norace, type = "response")
+  
+  # Generate ROC curve
+  ### OLD CODE
+  #roc_obj <- roc(response = testData$two_year_recid, predictor = probabilities)
+  #specificity<-coords(roc_obj, "best")$specificity[1]
+  #sensitivity<-coords(roc_obj, "best")$sensitivity[1]
+  ### NEW CODE
+  roc_obj <- roc(response = testData$two_year_recid, predictor = probabilities, levels = c(0,1), direction = "<")
+  specificity<-coords(roc_obj, "best")$specificity[1]
+  sensitivity<-coords(roc_obj, "best")$sensitivity[1]
+  # Find the best threshold
+  best_threshold <- coords(roc_obj, "best")$threshold[1]
+  
+  # Classify predictions based on the best threshold
+  predictions <- ifelse(probabilities > best_threshold, 1, 0)
+  
+  # Calculate accuracy
+  cm <- confusionMatrix(factor(predictions), factor(testData$two_year_recid))
+  best_accuracy <- sum(diag(cm$table)) / sum(cm$table)
+  
+  ### NEW CODE
+  # If threshold is minus infinity (useless model), we change it to Nan
+  # for plotting
+  if (best_threshold == -Inf) {
+    threshold <- NaN
+    best_accuracy <- NaN
+    specificity <- NaN
+    sensitivity <- NaN
+    auc <- NaN
+  }
+  
+  # Store model results
+  model_result <- data.frame(p = p, threshold = best_threshold, accuracy = best_accuracy,specificity=specificity,sensitivity=sensitivity,auc=auc(roc_obj))
+  model_results <- rbind(model_results, model_result)
+}
+model_results[1,]
+```
+
+Model result:\
+
+```{r}
+# Plot the changes in model_result
+par(mfrow = c(2, 3))
+plot(model_results$p, model_results$accuracy, type = "o", xlab = "proportion of noise in Y", ylab = "Accuracy", main = "Accuracy vs. p")
+plot(model_results$p, model_results$sensitivity, type = "o", xlab = "proportion of noise in Y", ylab = "sensitivity", main = "sensitivity vs. p")
+plot(model_results$p, model_results$specificity, type = "o", xlab = "proportion of noise in Y", ylab = "specificity", main = "specificity vs. p")
+plot(model_results$p, model_results$auc, type = "o", xlab = "proportion of noise in Y", ylab = "best treshold", main = "auc vs. p")
+plot(model_results$p, model_results$threshold, type = "o", xlab = "proportion of noise in Y", ylab = "best treshold", main = "best threshold vs. p")
+par(mfrow = c(1, 1))
+```
+
+# explore the subvariables(races) and Y
+
+# Fairness in different sub groups (LRM)
+
+-   Use different subgroups to train the model to see the result on test data/ subgroup test data.
+-   Use the whole training data to train the model to see the result on test data/ subgroup test data.
+
+## Sub group: Race
+
+### Split trainging data and use model
+
+```{r,warning=FALSE,message=FALSE}
+table(trainingData$race)
+# Creating a list of dataframes, one for each race
+trainingData_by_race <- split(trainingData, trainingData$race)
+
+# List to store models
+models_by_race <- list()
+# Iterate over each race
+for (race in names(trainingData_by_race)) {
+  # Extract the data for this race
+  data <- trainingData_by_race[[race]]
+  data<-as.data.frame(data)
+  # Identify constant columns
+  constant_columns <- sapply(data, function(x) length(unique(x)) == 1)
+  
+  # Remove constant columns
+  data <- data[, !constant_columns]
+  
+  # Train a logistic regression model on this data
+  model <- glm(two_year_recid ~ ., family = binomial(link = 'logit'), data = data)
+  
+  # Make predictions on the training data
+  probabilities_train <- predict(model, newdata = data, type = "response")
+  
+  # Generate ROC curve on the training data
+  ### OLD CODE
+  #roc_obj_train <- roc(data$two_year_recid, probabilities_train)
+  
+  # Calculate the best threshold on the training data
+  #best_threshold <- coords(roc_obj_train, "best")$threshold
+  ### NEW CODE
+  roc_obj <- roc(response = data$two_year_recid, predictor = probabilities_train, levels = c(0,1), direction = "<")
+  # Find the best threshold
+  best_threshold <- coords(roc_obj, "best")$threshold[1]
+  
+  # Store the model and the best threshold
+  models_by_race[[race]] <- list("model" = model, "threshold" = best_threshold)
+}
+
+
+
+```
+
+### Evaluate on test data
+
+#### 1. on all test data
+
+```{r,warning=FALSE,message=FALSE}
+# List to store results
+results_by_race <- list()
+
+# Iterate over each race
+for (race in names(models_by_race)) {
+  # Extract the model and the best threshold for this race
+  model <- models_by_race[[race]]$model
+  best_threshold <- models_by_race[[race]]$threshold
+  
+  # Extract the test data for this race
+  test_data <- testData[testData$race == race, ]
+  
+  # Make predictions on the test data
+  probabilities <- predict(model, newdata = test_data, type = "response")
+  
+  # Classify predictions based on the best threshold
+  predictions <- ifelse(probabilities > best_threshold, 1, 0)
+  
+  # Generate ROC curve
+  ### OLD CODE
+  #roc_obj <- roc(test_data$two_year_recid, probabilities)
+  ### NEW CODE
+  roc_obj <- roc(response = test_data$two_year_recid, predictor = probabilities, levels = c(0,1), direction = "<")
+  
+  # Calculate AUC
+  auc_value <- auc(roc_obj)
+  
+  # Generate confusion matrix
+  cm <- table(predictions, test_data$two_year_recid)
+  
+  # Calculate accuracy
+  accuracy <- sum(diag(cm)) / sum(cm)
+  
+  # Calculate sensitivity (recall) and specificity
+  sensitivity <- cm[2, 2] / (cm[2, 2] + cm[1, 2])
+  specificity <- cm[1, 1] / (cm[1, 1] + cm[2, 1])
+  
+  # Store the result
+  results_by_race[[race]] <- list(
+    "accuracy" = accuracy,
+    "sensitivity" = sensitivity,
+    "specificity" = specificity,
+    "auc" = auc_value,
+    "test_data_count" = nrow(test_data)
+  )
+}
+
+
+```
+
+-   result on the test data
+
+```{r}
+# Convert the list of results to a data frame
+results_df <- do.call(rbind, lapply(results_by_race, function(x) data.frame(t(unlist(x)))))
+# Add a 'race' column
+results_df$race <- rownames(results_df)
+# Rearrange columns
+results_df <- results_df[, c("race", "auc","accuracy", "sensitivity", "specificity", "test_data_count")]
+# Calculate the number of instances in each race subgroup in the training data
+training_counts <- sapply(trainingData_by_race, nrow)
+# Add these counts to the results data frame
+results_df$training_count <- training_counts[results_df$race]
+# Display the results data frame as a table
+knitr::kable(results_df, digits = 3)
+
+
+```
+
+#### 2. on different sub race test data
+
+```{r,warning=FALSE,message=FALSE}
+# Create a 6x6 list to store results
+results_matrix <- matrix(list(), nrow = 6, ncol = 6, 
+                         dimnames = list(names(models_by_race), names(models_by_race)))
+
+# Iterate over each race for models
+for (race_model in names(models_by_race)) {
+  # Extract the model and the best threshold for this race
+  model <- models_by_race[[race_model]]$model
+  best_threshold <- models_by_race[[race_model]]$threshold
+  
+  # Iterate over each race for test data
+  for (race_test in names(models_by_race)) {
+    # Extract the test data for this race
+    test_data <- testData[which(testData$race == race_test), ]
+    
+    # Make predictions on the test data
+    probabilities <- predict(model, newdata = test_data, type = "response")
+    
+    # Classify predictions based on the best threshold
+    predictions <- ifelse(probabilities > best_threshold, 1, 0)
+   
+    # Try to calculate the AUC
+    tryCatch({
+      # Generate ROC curve
+      ### OLD CODE
+      #roc_obj <- roc(test_data$two_year_recid, probabilities)
+      ### NEW CODE
+      roc_obj <- roc(response = test_data$two_year_recid, predictor = probabilities, levels = c(0,1), direction = "<")
+      # Calculate AUC
+      auc_value <- auc(roc_obj)
+    }, error = function(e) {
+      # If an error occurs, set AUC to NA
+      auc_value <- NA
+    })
+    
+    # Generate confusion matrix
+    cm <- table(predictions, test_data$two_year_recid)
+    
+    # Calculate accuracy
+    accuracy <- sum(diag(cm)) / sum(cm)
+        
+        # Check if the confusion matrix is 2x2
+    if (all(dim(cm) == 2)) {
+      # Calculate sensitivity (recall) and specificity
+      sensitivity <- cm[2, 2] / (cm[2, 2] + cm[1, 2])
+      specificity <- cm[1, 1] / (cm[1, 1] + cm[2, 1])
+    } else {
+      # If the confusion matrix is not 2x2, set sensitivity and specificity to NA
+      sensitivity <- NA
+      specificity <- NA
+    }
+
+    # Store the result in the corresponding cell of the results matrix
+    results_matrix[[race_model, race_test]] <- list(
+      "accuracy" = accuracy,
+      "sensitivity" = sensitivity,
+      "specificity" = specificity,
+      "auc" = auc_value,
+      "test_data_count" = nrow(test_data)
+    )
+  }
+}
+
+
+```
+
+-   The results:
+
+```{r}
+# Create a list to store the tables
+tables_list <- list()
+
+# Iterate over each race for test data
+for (race_test in names(models_by_race)) {
+  # Extract results for this test data subgroup
+  results_for_race <- sapply(results_matrix[, race_test], unlist)
+  
+  # Convert results to a data frame
+  df <- as.data.frame(t(results_for_race))
+  
+  # Set row names to race names in training data
+  rownames(df) <- names(models_by_race)
+  
+  # Add data frame to the list of tables
+  tables_list[[race_test]] <- df
+}
+
+```
+
+Print into tables.
+
+```{r results='asis',message=FALSE,warning=FALSE}
+library(knitr)
+
+for (race in names(tables_list)) {
+  cat(paste0("\n## Results for ", race, " test data\n"))
+  cat(knitr::kable(tables_list[[race]], digits = 3, 
+                   caption = paste0("Results for ", race, " test data"), 
+                   format = "html"), sep = "\n")
+}
+```
+
+Save them in the matrix:
+
+```{r}
+# Get the number of unique races
+num_races <- length(models_by_race)
+
+# Initialize a list to store all the matrices
+matrices_list <- list()
+
+# Define the performance measures
+performance_measures <- c("auc", "specificity", "accuracy", "sensitivity")
+
+# Iterate over each performance measure
+for (measure in performance_measures) {
+  
+  # Initialize an empty matrix to store the values for this measure
+  measure_matrix <- matrix(nrow = num_races, ncol = num_races)
+  
+  # Set dimension names to denote origin of data
+  dimnames(measure_matrix) <- list(
+    paste0("Train_", names(models_by_race)),
+    paste0("Test_", names(models_by_race))
+  )
+  
+  # Iterate over each cell in the results matrix
+  for (i in seq_len(num_races)) {
+    for (j in seq_len(num_races)) {
+      # Extract the value for this performance measure from the results for this cell
+      measure_matrix[i, j] <- results_matrix[[i, j]][[measure]]
+    }
+  }
+  
+  # Add the completed matrix to the list of matrices
+  matrices_list[[measure]] <- measure_matrix
+}
+
+
+```
+
+print:
+
+```{r results='asis',message=FALSE}
+library(knitr)
+
+# Iterate over each performance measure
+for (measure in performance_measures) {
+  # Print the measure name
+  cat(paste0("\n## ", measure, " matrix\n"))
+  
+  # Print the matrix as a table
+  cat(knitr::kable(matrices_list[[measure]], digits = 3, 
+                   caption = paste0(measure, " matrix"), 
+                   format = "html"), sep = "\n")
+}
+```
+
+## correlation heatmap of the performance:
+
+Here is only the trend. I normalize the matrix before the correlation
+
+```{r,warning=FALSE,message=FALSE}
+
+
+# Custom color palette in colorful ancient Chinese style
+chinese_palette <- c("#3c6464", "#cbc6b6")
+
+# Iterate over each performance measure
+for (measure in performance_measures) {
+  
+  # Normalize the matrix
+  norm_mat <- scale(matrices_list[[measure]])
+  
+  # Calculate correlation matrix
+  corr_mat <- cor(norm_mat, use = "pairwise.complete.obs")
+  
+  # Convert correlation matrix to a long format data frame
+  corr_df <- reshape2::melt(corr_mat)
+ 
+  # Create the heatmap
+  p <- ggplot(data = corr_df, aes(x=Var1, y=Var2, fill=value)) +
+    geom_tile() +
+    geom_text(aes(label = round(value, 2)), size = 4, color = "white") +  # Add white-colored correlation coefficients on heatmap
+    scale_fill_gradientn(colors = chinese_palette, 
+                         name="Pearson\nCorrelation") +
+    theme_minimal() + 
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+                                     size = 12, hjust = 1),
+          axis.text.y = element_text(size = 12)) +
+    coord_fixed() +
+    ggtitle(paste0(measure, " Correlation Heatmap"))
+  
+  print(p)
+}
+
+
+```
+
+# Adding noise to different sub group (Function C noise swap)
+
+In the real life, different sub group's data quality can be different. So we add different amount of noise to each sub race and see its fairness and model performance in the test data.\
+We only add noise to a single race in its two_year_recid (swap 0 and 1). The testing data is the same (for now). Considering the original ratio of sub races are different, we use the proportion (0% - 100%) of the number of the selected race. But we need to mind the proportion difference later. After that, one way may fix this is using SMOTE sampling method to the race and make the the number of different race on testing data are roughly same while I am hesitating this because in the real life data, the sub race may not be balanced. So count it as the optional one.\
+
+## Function to add noise to a specific sub-race
+
+```{r}
+# Function to add noise to a specific sub-race
+add_noise_to_sub_race <- function(data, race_to_add_noise, proportion) {
+  # Identify the rows corresponding to the selected race
+  race_rows <- which(data$race == race_to_add_noise)
+  
+  # Create a subset data frame for the selected race
+  subset_data <- data[race_rows,]
+  
+  # Apply the noisy_swap function to the subset data
+  subset_data_with_noise <- noisy_swap(subset_data, "two_year_recid", proportion)
+  
+  # Replace the original rows with the noisy rows
+  data[race_rows,] <- subset_data_with_noise
+  
+  return(data)
+}
+```
+
+## Use LR model on original unbalanced test data:
+
+Here we use LR model to different sub races' adding noise.
+
+```{r,warning=FALSE, message=FALSE}
+# Get the unique racial subgroups
+racial_subgroups <- unique(trainingData$race)
+
+# Empty vectors to store results
+p_values <- seq(0, 100, 2)
+model_results <- data.frame()
+
+# Iterate over racial subgroups
+for (race_to_add_noise in racial_subgroups) {
+  # Iterate over p values
+  for (p in p_values) {
+    # Apply noise to the specific race in the training data
+    trainingData_with_noise <- add_noise_to_sub_race(trainingData, race_to_add_noise, p)
+    
+    # Fit the logistic regression model
+    model <- glm(two_year_recid ~ ., family = binomial(link = 'logit'), data = trainingData_with_noise)
+    
+    # Make predictions on the test data
+    probabilities <- predict(model, newdata = testData, type = "response")
+    
+    # Generate ROC curve
+    ### OLD CODE
+    #roc_obj <- roc(response = testData$two_year_recid, predictor = probabilities)
+    #specificity <- coords(roc_obj, "best")$specificity
+    #sensitivity <- coords(roc_obj, "best")$sensitivity
+    
+    # Find the best threshold
+    #best_threshold <- coords(roc_obj, "best")$threshold
+    ### NEW CODE
+    roc_obj <- roc(response = testData$two_year_recid, predictor = probabilities, levels = c(0,1), direction = "<")
+    specificity<-coords(roc_obj, "best")$specificity[1]
+    sensitivity<-coords(roc_obj, "best")$sensitivity[1]
+    # Find the best threshold
+    best_threshold <- coords(roc_obj, "best")$threshold[1]
+    
+    # Classify predictions based on the best threshold
+    predictions <- ifelse(probabilities > best_threshold, 1, 0)
+    
+    # Calculate accuracy
+    cm <- confusionMatrix(factor(predictions), factor(testData$two_year_recid))
+    best_accuracy <- sum(diag(cm$table)) / sum(cm$table)
+    
+    # Store model results
+    model_result <- data.frame(race = race_to_add_noise, p = p, threshold = best_threshold, accuracy = best_accuracy, specificity = specificity, sensitivity = sensitivity, auc = auc(roc_obj))
+    model_results <- rbind(model_results, model_result)
+  }
+}
+
+
+
+```
+
+Plot the changes in model_result:\
+
+```{r}
+# library(ggplot2)
+
+par(mfrow = c(2, 3))
+# Plot Accuracy vs. p
+ggplot(model_results, aes(x = p, y = accuracy, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Accuracy", title = "Accuracy vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot Sensitivity vs. p
+ggplot(model_results, aes(x = p, y = sensitivity, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Sensitivity", title = "Sensitivity vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot Specificity vs. p
+ggplot(model_results, aes(x = p, y = specificity, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Specificity", title = "Specificity vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot AUC vs. p
+ggplot(model_results, aes(x = p, y = auc, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "AUC", title = "AUC vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot Best Threshold vs. p
+ggplot(model_results, aes(x = p, y = threshold, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Best Threshold", title = "Best Threshold vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+par(mfrow = c(1, 1))
+
+```
+
+## Use LR model on SMOTE race balanced traing data:
+
+### Combine other races into Other
+
+Now for convenience we just consider three races: "Caucasian," "African-American," and "Others", and make these three balanced.
+
+```{r,warning=FALSE,message=FALSE}
+#library(DMwR) # Required for SMOTE function
+trainingData_newrace<-trainingData
+testData_newrace<-testData
+
+### Combine trainingData
+# Recode the 'race' variable to include only "Caucasian," "African-American," and "Others"
+trainingData_newrace$race <- ifelse(trainingData_newrace$race %in% c("Caucasian", "African-American"), as.character(trainingData_newrace$race), "Others")
+# Convert the 'race' variable to a factor
+trainingData_newrace$race <- as.factor(trainingData_newrace$race)
+table(trainingData_newrace$race)
+
+
+#### Combine test data
+testData_newrace <- testData
+testData_newrace$race <- ifelse(testData_newrace$race %in% c("Caucasian", "African-American"), as.character(testData_newrace$race), "Others")
+testData_newrace$race <- as.factor(testData_newrace$race)
+testData_newrace <- testData_newrace[testData_newrace$race != "Others", ]# Only keep black and white people
+
+```
+
+### Use SMOTE to balance the traing data by the 'race' variable
+
+```{r}
+# Split the data by race
+data_Caucasian <- trainingData_newrace[trainingData_newrace$race == "Caucasian",]
+data_African_American <- trainingData_newrace[trainingData_newrace$race == "African-American",]
+data_Others <- trainingData_newrace[trainingData_newrace$race == "Others",]
+
+# Find the maximum number of instances across the three race categories
+max_instances <- max(nrow(data_Caucasian), nrow(data_African_American), nrow(data_Others))
+
+# Oversample the minority classes
+set.seed(42) # For reproducibility
+data_Caucasian_balanced <- data_Caucasian[sample(1:nrow(data_Caucasian), max_instances, replace = TRUE),]
+data_African_American_balanced <- data_African_American[sample(1:nrow(data_African_American), max_instances, replace = TRUE),]
+data_Others_balanced <- data_Others[sample(1:nrow(data_Others), max_instances, replace = TRUE),]
+
+# Combine the balanced data back together
+trainingData_race_balanced <- rbind(data_Caucasian_balanced, data_African_American_balanced)
+
+
+# Check the distribution of the new 'race' variable in the balanced data
+table(trainingData_race_balanced$race)
+
+```
+
+Now the training data are balanced.
+
+### Rerun the code, adding noise to sub races
+
+```{r,warning=FALSE, message=FALSE}
+# Get the unique racial subgroups
+racial_subgroups <- unique(trainingData_race_balanced$race)
+
+# Empty vectors to store results
+p_values <- seq(0, 100, 2)
+model_results <- data.frame()
+
+# Iterate over racial subgroups
+for (race_to_add_noise in racial_subgroups) {
+  # Iterate over p values
+  for (p in p_values) {
+    # Apply noise to the specific race in the training data
+    trainingData_race_balanced_with_noise <- add_noise_to_sub_race(trainingData_race_balanced, race_to_add_noise, p)
+    
+    # Fit the logistic regression model
+    model <- glm(two_year_recid ~ ., family = binomial(link = 'logit'), data = trainingData_race_balanced_with_noise)
+    
+    # Make predictions on the test data
+    probabilities <- predict(model, newdata = testData_newrace, type = "response")
+    
+    # Generate ROC curve
+    ### OLD CODE
+    #roc_obj <- roc(response = testData_newrace$two_year_recid, predictor = probabilities)
+    #specificity <- coords(roc_obj, "best")$specificity
+    #sensitivity <- coords(roc_obj, "best")$sensitivity
+    
+    # Find the best threshold
+    #best_threshold <- coords(roc_obj, "best")$threshold
+    ### NEW CODE
+    roc_obj <- roc(response = testData_newrace$two_year_recid, predictor = probabilities, levels = c(0,1), direction = "<")
+    specificity<-coords(roc_obj, "best")$specificity[1]
+    sensitivity<-coords(roc_obj, "best")$sensitivity[1]
+    # Find the best threshold
+    best_threshold <- coords(roc_obj, "best")$threshold[1]
+    
+    # Classify predictions based on the best threshold
+    predictions <- ifelse(probabilities > best_threshold, 1, 0)
+    
+    # Calculate accuracy
+    cm <- confusionMatrix(factor(predictions), factor(testData_newrace$two_year_recid))
+    best_accuracy <- sum(diag(cm$table)) / sum(cm$table)
+    
+    # Store model results
+    model_result <- data.frame(race = race_to_add_noise, p = p, threshold = best_threshold, accuracy = best_accuracy, specificity = specificity, sensitivity = sensitivity, auc = auc(roc_obj))
+    model_results <- rbind(model_results, model_result)
+  }
+}
+
+```
+
+Plot the changes in model_result:\
+
+```{r}
+# library(ggplot2)
+
+par(mfrow = c(2, 3))
+# Plot Accuracy vs. p
+ggplot(model_results, aes(x = p, y = accuracy, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Accuracy", title = "Accuracy vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot Sensitivity vs. p
+ggplot(model_results, aes(x = p, y = sensitivity, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Sensitivity", title = "Sensitivity vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot Specificity vs. p
+ggplot(model_results, aes(x = p, y = specificity, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Specificity", title = "Specificity vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot AUC vs. p
+ggplot(model_results, aes(x = p, y = auc, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "AUC", title = "AUC vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot Best Threshold vs. p
+ggplot(model_results, aes(x = p, y = threshold, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Best Threshold", title = "Best Threshold vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+par(mfrow = c(1, 1))
+```
+
+### Balanced training data and balanced test data.
+
+There are some worries of the unbalance on the test data that may lead to a biased interpretation on the model results and fairness. In order to deal with this, we use smote to balanced the race on the test data and consider the sub races (Caucassian, African-American and Others) all equally.\
+
+## Use SMOTE to balance the train and test data by the 'race' variable
+
+```{r}
+# Split the data by race
+data_Caucasian <- testData_newrace[testData_newrace$race == "Caucasian",]
+data_African_American <- testData_newrace[testData_newrace$race == "African-American",]
+data_Others <- testData_newrace[testData_newrace$race == "Others",]
+
+# Find the maximum number of instances across the three race categories
+max_instances <- max(nrow(data_Caucasian), nrow(data_African_American), nrow(data_Others))
+
+# Oversample the minority classes
+set.seed(42) # For reproducibility
+data_Caucasian_balanced <- data_Caucasian[sample(1:nrow(data_Caucasian), max_instances, replace = TRUE),]
+data_African_American_balanced <- data_African_American[sample(1:nrow(data_African_American), max_instances, replace = TRUE),]
+data_Others_balanced <- data_Others[sample(1:nrow(data_Others), max_instances, replace = TRUE),]
+
+# Combine the balanced data back together
+testData_race_balanced <- rbind(data_Caucasian_balanced, data_African_American_balanced)
+
+# Check the distribution of the new 'race' variable in the balanced data
+table(testData_race_balanced$race)
+```
+
+Now the test data are balanced.
+
+### Rerun the code, adding noise to sub races
+
+```{r,warning=FALSE, message=FALSE}
+# Get the unique racial subgroups
+racial_subgroups <- unique(trainingData_race_balanced$race)
+
+# Empty vectors to store results
+p_values <- seq(0, 100, 2)
+model_results <- data.frame()
+
+# Iterate over racial subgroups
+for (race_to_add_noise in racial_subgroups) {
+  # Iterate over p values
+  for (p in p_values) {
+    # Apply noise to the specific race in the training data
+    trainingData_race_balanced_with_noise <- add_noise_to_sub_race(trainingData_race_balanced, race_to_add_noise, p)
+    
+    # Fit the logistic regression model
+    model <- glm(two_year_recid ~ ., family = binomial(link = 'logit'), data = trainingData_race_balanced_with_noise)
+    
+    # Make predictions on the test data
+    probabilities <- predict(model, newdata = testData_race_balanced, type = "response")
+    
+    # Generate ROC curve
+    ### OLD CODE
+    #roc_obj <- roc(response = testData_race_balanced$two_year_recid, predictor = probabilities)
+    #specificity <- coords(roc_obj, "best")$specificity
+    #sensitivity <- coords(roc_obj, "best")$sensitivity
+    
+    # Find the best threshold
+    #best_threshold <- coords(roc_obj, "best")$threshold
+    ### NEW CODE
+    roc_obj <- roc(response = testData_race_balanced$two_year_recid, predictor = probabilities, levels = c(0,1), direction = "<")
+    specificity<-coords(roc_obj, "best")$specificity[1]
+    sensitivity<-coords(roc_obj, "best")$sensitivity[1]
+    # Find the best threshold
+    best_threshold <- coords(roc_obj, "best")$threshold[1]
+    
+    # Classify predictions based on the best threshold
+    predictions <- ifelse(probabilities > best_threshold, 1, 0)
+    
+    # Calculate accuracy
+    cm <- confusionMatrix(factor(predictions), factor(testData_race_balanced$two_year_recid))
+    best_accuracy <- sum(diag(cm$table)) / sum(cm$table)
+    
+    # Store model results
+    model_result <- data.frame(race = race_to_add_noise, p = p, threshold = best_threshold, accuracy = best_accuracy, specificity = specificity, sensitivity = sensitivity, auc = auc(roc_obj))
+    model_results <- rbind(model_results, model_result)
+  }
+}
+
+```
+
+Plot the changes in model_result:\
+
+```{r}
+# library(ggplot2)
+
+par(mfrow = c(2, 3))
+# Plot Accuracy vs. p
+ggplot(model_results, aes(x = p, y = accuracy, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Accuracy", title = "Accuracy vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot Sensitivity vs. p
+ggplot(model_results, aes(x = p, y = sensitivity, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Sensitivity", title = "Sensitivity vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot Specificity vs. p
+ggplot(model_results, aes(x = p, y = specificity, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Specificity", title = "Specificity vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot AUC vs. p
+ggplot(model_results, aes(x = p, y = auc, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "AUC", title = "AUC vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot Best Threshold vs. p
+ggplot(model_results, aes(x = p, y = threshold, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Best Threshold", title = "Best Threshold vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+par(mfrow = c(1, 1))
+```
+
+## See the performance only on specific race test data on balanced train and test data set.
+
+-   There is one thing that may differ from the other part here is that in this part, we need a calibration test data set which I separate the original test data set into a half and half.
+
+Here is the code we randomly cut the test data in half. The calibration is called realtestdata, and the remain test one which we will use to get the AUC and best threshold is still called tesData_race_balanced.\
+
+```{r}
+# Split each race subgroup in testData_race_balanced into two halves
+
+realtestdata_list <- list()
+testData_race_balanced_list <- list()
+
+for (race in racial_subgroups) {
+  data_subgroup <- testData_race_balanced[testData_race_balanced$race == race,]
+  
+  # Randomly shuffle the rows and split the data into two
+  set.seed(42) # For reproducibility
+  shuffled_rows <- sample(1:nrow(data_subgroup))
+  half_point <- floor(nrow(data_subgroup) / 2)
+  
+  realtestdata_list[[race]] <- data_subgroup[shuffled_rows[1:half_point],]
+  testData_race_balanced_list[[race]] <- data_subgroup[shuffled_rows[(half_point + 1):nrow(data_subgroup)],]
+}
+
+# Combine the subgroups to form realtestdata and testData_race_balanced
+realtestdata_balanced <- do.call(rbind, realtestdata_list)
+testData_race_balanced <- do.call(rbind, testData_race_balanced_list)
+
+# Checking the distribution of the race in both datasets
+table(realtestdata_balanced$race)
+table(testData_race_balanced$race)
+
+
+```
+
+The AUC somehow increase because the test data is smaller. So we need some calibration to see the real accuracy (confusion matrix) from a new test data.
+
+```{r,message=FALSE, warning=FALSE}
+# Initialize an empty dataframe to store results
+model_results_combinations <- data.frame()
+model_results_combinations_real <- data.frame()
+
+# Iterate over racial subgroups for adding noise to training data
+for (race_train in racial_subgroups) {
+  
+  # Iterate over p values
+  for (p in p_values) {
+    
+    # Apply noise to the specific race in the training data
+    trainingData_race_balanced_with_noise <- add_noise_to_sub_race(trainingData_race_balanced, race_train, p)
+    
+    # Fit the logistic regression model
+    model <- glm(two_year_recid ~ ., family = binomial(link = 'logit'), data = trainingData_race_balanced_with_noise)
+    
+    # Iterate over racial subgroups for evaluating on test data
+    for (race_test in racial_subgroups) {
+      
+      # Subset the test data by the current race_test
+      testData_subgroup <- testData_race_balanced[testData_race_balanced$race == race_test,]
+      testData_subgroup_real <- realtestdata_balanced[realtestdata_balanced$race == race_test,]
+      
+      # Make predictions on the test data subgroup
+      probabilities <- predict(model, newdata = testData_subgroup, type = "response")
+      probabilities_real <- predict(model, newdata = testData_subgroup_real, type = "response")
+      
+      # Generate ROC curve
+      ### OLD CODE
+      #roc_obj <- roc(response = testData_subgroup$two_year_recid, predictor = probabilities)
+      #specificity <- coords(roc_obj, "best")$specificity
+      #sensitivity <- coords(roc_obj, "best")$sensitivity
+      
+      # Find the best threshold
+      #best_threshold <- coords(roc_obj, "best")$threshold
+      ### NEW CODE
+      roc_obj <- roc(response = testData_subgroup$two_year_recid, predictor = probabilities, levels = c(0,1), direction = "<")
+    specificity<-coords(roc_obj, "best")$specificity[1]
+    sensitivity<-coords(roc_obj, "best")$sensitivity[1]
+    # Find the best threshold
+    best_threshold <- coords(roc_obj, "best")$threshold[1]
+    ###
+      
+      # Classify predictions based on the best threshold
+      predictions <- ifelse(probabilities > best_threshold, 1, 0)
+      predictions_real <- ifelse(probabilities_real > best_threshold, 1, 0)
+      
+      # Calculate accuracy
+      cm <- confusionMatrix(factor(predictions), factor(testData_subgroup$two_year_recid))
+      best_accuracy <- sum(diag(cm$table)) / sum(cm$table)
+      
+      cm_real <- confusionMatrix(factor(predictions_real), factor(testData_subgroup_real$two_year_recid))
+      best_accuracy_real <- sum(diag(cm_real$table)) / sum(cm_real$table)
+      sensitivity_real <- cm_real$byClass["Sensitivity"]
+      specificity_real <- cm_real$byClass["Specificity"]
+
+      
+      # Store model results. test data (not calibration)
+      model_result <- data.frame(train_race_noise = race_train, p = p, test_race_eval = race_test, threshold = best_threshold, accuracy = best_accuracy, specificity = specificity, sensitivity = sensitivity, auc = auc(roc_obj))
+      model_results_combinations <- rbind(model_results_combinations, model_result)
+      # Store model results. test real data (calibration)
+      model_result_real <- data.frame(train_race_noise = race_train, p = p, test_race_eval = race_test, accuracy = best_accuracy_real, specificity = specificity_real, sensitivity = sensitivity_real)
+      model_results_combinations_real <- rbind(model_results_combinations_real, model_result_real)
+      
+      
+    }
+  }
+}
+
+```
+
+\
+Model results on test data not calibration:\
+
+```{r}
+# Define a helper function to create plots for a specific metric
+plot_combined_trainings <- function(data, metric, metric_column) {
+  p <- ggplot(data, aes_string(x = "p", y = metric_column, color = "test_race_eval")) +
+    geom_line() +
+    labs(x = "Proportion of Noise in Y", y = metric, 
+         title = paste(metric, "(Noise added on:", unique(data$train_race_noise), ")"), 
+         color = "Race of Test Data") +
+    theme_minimal() + theme(plot.title = element_text(size = 8))
+  
+  return(p)
+}
+
+# Metrics to iterate over
+metrics <- list("AUC", "Accuracy", "Sensitivity", "Specificity", "Best Threshold")
+metric_columns <- c("auc", "accuracy", "sensitivity", "specificity", "threshold")
+
+
+# Iterate over each metric and display the combined plots for all training races
+for(i in 1:length(metrics)) {
+  metric <- metrics[[i]]
+  metric_column <- metric_columns[[i]]
+  
+  for (train_race in racial_subgroups) {
+    subset_data <- model_results_combinations[model_results_combinations$train_race_noise == train_race,]
+    p <- plot_combined_trainings(subset_data, metric, metric_column)
+    
+    # Display the plot
+    print(p)
+  }
+}
+
+
+
+```
+
+Model results on real test data, A.K.A. calibration:\
+
+```{r}
+
+# Metrics to iterate over
+metrics <- list( "Accuracy", "Sensitivity", "Specificity")
+metric_columns <- c( "accuracy", "sensitivity", "specificity")
+
+
+# Iterate over each metric and display the combined plots for all training races
+for(i in 1:length(metrics)) {
+  metric <- metrics[[i]]
+  metric_column <- metric_columns[[i]]
+  
+  for (train_race in racial_subgroups) {
+    subset_data <- model_results_combinations_real[model_results_combinations$train_race_noise == train_race,]
+    p <- plot_combined_trainings(subset_data, metric, metric_column)
+    
+    # Display the plot
+    print(p)
+  }
+}
+
+
+
+```
+
+## Conclusion and discussion of this part:
+
+-   From the <Use LR model on original unbalanced test data:> we can tell that in general, the bigger the data amount of a certain group is, the less robust of the model is when adding same proportion of noise.
+
+-   When we balanced the training and test data, from the AUC graph we can tell that the African-American group is more robust than other races when adding noise to the training data. This reveals the inner difference on the robustness of the races in the model.
+
+# Adding noise (Function D1 make 1 into 0) to different sub group
+This section and the following section a basically the same with the previous section.
+
+## Function to add noise to a specific sub-race
+
+```{r}
+# Function to add noise to a specific sub-race
+add_noise_to_sub_race <- function(data, race_to_add_noise, proportion) {
+  # Identify the rows corresponding to the selected race
+  race_rows <- which(data$race == race_to_add_noise)
+  
+  # Create a subset data frame for the selected race
+  subset_data <- data[race_rows,]
+  
+  # Apply the noisy_swap function to the subset data
+  
+  subset_data_with_noise <- reduce_positive_noise(subset_data, "two_year_recid",0, proportion) # change the positive parameter here 0 or 1
+  # noisy_swap(subset_data, "two_year_recid", proportion) # Function C's code
+  
+  # Replace the original rows with the noisy rows
+  data[race_rows,] <- subset_data_with_noise
+  
+  return(data)
+}
+```
+
+## Use LR model on original unbalanced test data:
+
+Here we use LR model to different sub races' adding noise.
+
+```{r,warning=FALSE, message=FALSE}
+# Get the unique racial subgroups
+racial_subgroups <- unique(trainingData$race)
+
+# Empty vectors to store results
+p_values <- seq(0, 100, 2)
+model_results <- data.frame()
+
+# Iterate over racial subgroups
+for (race_to_add_noise in racial_subgroups) {
+  # Iterate over p values
+  for (p in p_values) {
+    # Apply noise to the specific race in the training data
+    trainingData_with_noise <- add_noise_to_sub_race(trainingData, race_to_add_noise, p)
+    
+    # Fit the logistic regression model
+    model <- glm(two_year_recid ~ ., family = binomial(link = 'logit'), data = trainingData_with_noise)
+    
+    # Make predictions on the test data
+    probabilities <- predict(model, newdata = testData, type = "response")
+    
+    # Generate ROC curve
+    ### OLD CODE
+    #roc_obj <- roc(response = testData$two_year_recid, predictor = probabilities)
+    #specificity <- coords(roc_obj, "best")$specificity
+    #sensitivity <- coords(roc_obj, "best")$sensitivity
+    
+    # Find the best threshold
+    #best_threshold <- coords(roc_obj, "best")$threshold
+    ### NEW CODE
+    roc_obj <- roc(response = testData$two_year_recid, predictor = probabilities, levels = c(0,1), direction = "<")
+    specificity<-coords(roc_obj, "best")$specificity[1]
+    sensitivity<-coords(roc_obj, "best")$sensitivity[1]
+    # Find the best threshold
+    best_threshold <- coords(roc_obj, "best")$threshold[1]
+    
+    # Classify predictions based on the best threshold
+    predictions <- ifelse(probabilities > best_threshold, 1, 0)
+    
+    # Calculate accuracy
+    cm <- confusionMatrix(factor(predictions), factor(testData$two_year_recid))
+    best_accuracy <- sum(diag(cm$table)) / sum(cm$table)
+    
+    # Store model results
+    model_result <- data.frame(race = race_to_add_noise, p = p, threshold = best_threshold, accuracy = best_accuracy, specificity = specificity, sensitivity = sensitivity, auc = auc(roc_obj))
+    model_results <- rbind(model_results, model_result)
+  }
+}
+
+
+
+```
+
+Plot the changes in model_result:\
+
+```{r}
+# library(ggplot2)
+
+par(mfrow = c(2, 3))
+# Plot Accuracy vs. p
+ggplot(model_results, aes(x = p, y = accuracy, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Accuracy", title = "Accuracy vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot Sensitivity vs. p
+ggplot(model_results, aes(x = p, y = sensitivity, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Sensitivity", title = "Sensitivity vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot Specificity vs. p
+ggplot(model_results, aes(x = p, y = specificity, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Specificity", title = "Specificity vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot AUC vs. p
+ggplot(model_results, aes(x = p, y = auc, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "AUC", title = "AUC vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot Best Threshold vs. p
+ggplot(model_results, aes(x = p, y = threshold, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Best Threshold", title = "Best Threshold vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+par(mfrow = c(1, 1))
+
+```
+
+## Use LR model on SMOTE race balanced traing data:
+
+### Combine other races into Other
+
+Now for convenience we just consider three races: "Caucasian," "African-American," and "Others", and make these three balanced.
+
+```{r,warning=FALSE,message=FALSE}
+#library(DMwR) # Required for SMOTE function
+trainingData_newrace<-trainingData
+testData_newrace<-testData
+
+### Combine trainingData
+# Recode the 'race' variable to include only "Caucasian," "African-American," and "Others"
+trainingData_newrace$race <- ifelse(trainingData_newrace$race %in% c("Caucasian", "African-American"), as.character(trainingData_newrace$race), "Others")
+# Convert the 'race' variable to a factor
+trainingData_newrace$race <- as.factor(trainingData_newrace$race)
+table(trainingData_newrace$race)
+
+
+#### Combine test data
+testData_newrace <- testData
+testData_newrace$race <- ifelse(testData_newrace$race %in% c("Caucasian", "African-American"), as.character(testData_newrace$race), "Others")
+testData_newrace$race <- as.factor(testData_newrace$race)
+testData_newrace <- testData_newrace[testData_newrace$race != "Others", ]# Only keep black and white people
+
+```
+
+### Use SMOTE to balance the traing data by the 'race' variable
+
+```{r}
+# Split the data by race
+data_Caucasian <- trainingData_newrace[trainingData_newrace$race == "Caucasian",]
+data_African_American <- trainingData_newrace[trainingData_newrace$race == "African-American",]
+data_Others <- trainingData_newrace[trainingData_newrace$race == "Others",]
+
+# Find the maximum number of instances across the three race categories
+max_instances <- max(nrow(data_Caucasian), nrow(data_African_American), nrow(data_Others))
+
+# Oversample the minority classes
+set.seed(42) # For reproducibility
+data_Caucasian_balanced <- data_Caucasian[sample(1:nrow(data_Caucasian), max_instances, replace = TRUE),]
+data_African_American_balanced <- data_African_American[sample(1:nrow(data_African_American), max_instances, replace = TRUE),]
+data_Others_balanced <- data_Others[sample(1:nrow(data_Others), max_instances, replace = TRUE),]
+
+# Combine the balanced data back together
+trainingData_race_balanced <- rbind(data_Caucasian_balanced, data_African_American_balanced)
+
+
+# Check the distribution of the new 'race' variable in the balanced data
+table(trainingData_race_balanced$race)
+
+```
+
+Now the training data are balanced.
+
+### Rerun the code, adding noise to sub races
+
+```{r,warning=FALSE, message=FALSE}
+# Get the unique racial subgroups
+racial_subgroups <- unique(trainingData_race_balanced$race)
+
+# Empty vectors to store results
+p_values <- seq(0, 100, 2)
+model_results <- data.frame()
+
+# Iterate over racial subgroups
+for (race_to_add_noise in racial_subgroups) {
+  # Iterate over p values
+  for (p in p_values) {
+    # Apply noise to the specific race in the training data
+    trainingData_race_balanced_with_noise <- add_noise_to_sub_race(trainingData_race_balanced, race_to_add_noise, p)
+    
+    # Fit the logistic regression model
+    model <- glm(two_year_recid ~ ., family = binomial(link = 'logit'), data = trainingData_race_balanced_with_noise)
+    
+    # Make predictions on the test data
+    probabilities <- predict(model, newdata = testData_newrace, type = "response")
+    
+    # Generate ROC curve
+    ### OLD CODE
+    #roc_obj <- roc(response = testData_newrace$two_year_recid, predictor = probabilities)
+    #specificity <- coords(roc_obj, "best")$specificity
+    #sensitivity <- coords(roc_obj, "best")$sensitivity
+    
+    # Find the best threshold
+    #best_threshold <- coords(roc_obj, "best")$threshold
+    ### NEW CODE
+    roc_obj <- roc(response = testData_newrace$two_year_recid, predictor = probabilities, levels = c(0,1), direction = "<")
+    specificity<-coords(roc_obj, "best")$specificity[1]
+    sensitivity<-coords(roc_obj, "best")$sensitivity[1]
+    # Find the best threshold
+    best_threshold <- coords(roc_obj, "best")$threshold[1]
+    
+    # Classify predictions based on the best threshold
+    predictions <- ifelse(probabilities > best_threshold, 1, 0)
+    
+    # Calculate accuracy
+    cm <- confusionMatrix(factor(predictions), factor(testData_newrace$two_year_recid))
+    best_accuracy <- sum(diag(cm$table)) / sum(cm$table)
+    
+    # Store model results
+    model_result <- data.frame(race = race_to_add_noise, p = p, threshold = best_threshold, accuracy = best_accuracy, specificity = specificity, sensitivity = sensitivity, auc = auc(roc_obj))
+    model_results <- rbind(model_results, model_result)
+  }
+}
+
+```
+
+Plot the changes in model_result:\
+
+```{r}
+# library(ggplot2)
+
+par(mfrow = c(2, 3))
+# Plot Accuracy vs. p
+ggplot(model_results, aes(x = p, y = accuracy, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Accuracy", title = "Accuracy vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot Sensitivity vs. p
+ggplot(model_results, aes(x = p, y = sensitivity, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Sensitivity", title = "Sensitivity vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot Specificity vs. p
+ggplot(model_results, aes(x = p, y = specificity, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Specificity", title = "Specificity vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot AUC vs. p
+ggplot(model_results, aes(x = p, y = auc, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "AUC", title = "AUC vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot Best Threshold vs. p
+ggplot(model_results, aes(x = p, y = threshold, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Best Threshold", title = "Best Threshold vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+par(mfrow = c(1, 1))
+```
+
+### Balanced training data and balanced test data.
+
+There are some worries of the unbalance on the test data that may lead to a biased interpretation on the model results and fairness. In order to deal with this, we use smote to balanced the race on the test data and consider the sub races (Caucassian, African-American and Others) all equally.\
+
+## Use SMOTE to balance the train and test data by the 'race' variable
+
+```{r}
+# Split the data by race
+data_Caucasian <- testData_newrace[testData_newrace$race == "Caucasian",]
+data_African_American <- testData_newrace[testData_newrace$race == "African-American",]
+data_Others <- testData_newrace[testData_newrace$race == "Others",]
+
+# Find the maximum number of instances across the three race categories
+max_instances <- max(nrow(data_Caucasian), nrow(data_African_American), nrow(data_Others))
+
+# Oversample the minority classes
+set.seed(42) # For reproducibility
+data_Caucasian_balanced <- data_Caucasian[sample(1:nrow(data_Caucasian), max_instances, replace = TRUE),]
+data_African_American_balanced <- data_African_American[sample(1:nrow(data_African_American), max_instances, replace = TRUE),]
+data_Others_balanced <- data_Others[sample(1:nrow(data_Others), max_instances, replace = TRUE),]
+
+# Combine the balanced data back together
+testData_race_balanced <- rbind(data_Caucasian_balanced, data_African_American_balanced)
+
+# Check the distribution of the new 'race' variable in the balanced data
+table(testData_race_balanced$race)
+```
+
+Now the test data are balanced.
+
+### Rerun the code, adding noise to sub races
+
+```{r,warning=FALSE, message=FALSE}
+# Get the unique racial subgroups
+racial_subgroups <- unique(trainingData_race_balanced$race)
+
+# Empty vectors to store results
+p_values <- seq(0, 100, 2)
+model_results <- data.frame()
+
+# Iterate over racial subgroups
+for (race_to_add_noise in racial_subgroups) {
+  # Iterate over p values
+  for (p in p_values) {
+    # Apply noise to the specific race in the training data
+    trainingData_race_balanced_with_noise <- add_noise_to_sub_race(trainingData_race_balanced, race_to_add_noise, p)
+    
+    # Fit the logistic regression model
+    model <- glm(two_year_recid ~ ., family = binomial(link = 'logit'), data = trainingData_race_balanced_with_noise)
+    
+    # Make predictions on the test data
+    probabilities <- predict(model, newdata = testData_race_balanced, type = "response")
+    
+    # Generate ROC curve
+    ### OLD CODE
+    #roc_obj <- roc(response = testData_race_balanced$two_year_recid, predictor = probabilities)
+    #specificity <- coords(roc_obj, "best")$specificity
+    #sensitivity <- coords(roc_obj, "best")$sensitivity
+    
+    # Find the best threshold
+    #best_threshold <- coords(roc_obj, "best")$threshold
+    ### NEW CODE
+    roc_obj <- roc(response = testData_race_balanced$two_year_recid, predictor = probabilities, levels = c(0,1), direction = "<")
+    specificity<-coords(roc_obj, "best")$specificity[1]
+    sensitivity<-coords(roc_obj, "best")$sensitivity[1]
+    # Find the best threshold
+    best_threshold <- coords(roc_obj, "best")$threshold[1]
+    
+    # Classify predictions based on the best threshold
+    predictions <- ifelse(probabilities > best_threshold, 1, 0)
+    
+    # Calculate accuracy
+    cm <- confusionMatrix(factor(predictions), factor(testData_race_balanced$two_year_recid))
+    best_accuracy <- sum(diag(cm$table)) / sum(cm$table)
+    
+    # Store model results
+    model_result <- data.frame(race = race_to_add_noise, p = p, threshold = best_threshold, accuracy = best_accuracy, specificity = specificity, sensitivity = sensitivity, auc = auc(roc_obj))
+    model_results <- rbind(model_results, model_result)
+  }
+}
+
+```
+
+Plot the changes in model_result:\
+
+```{r}
+# library(ggplot2)
+
+par(mfrow = c(2, 3))
+# Plot Accuracy vs. p
+ggplot(model_results, aes(x = p, y = accuracy, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Accuracy", title = "Accuracy vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot Sensitivity vs. p
+ggplot(model_results, aes(x = p, y = sensitivity, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Sensitivity", title = "Sensitivity vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot Specificity vs. p
+ggplot(model_results, aes(x = p, y = specificity, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Specificity", title = "Specificity vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot AUC vs. p
+ggplot(model_results, aes(x = p, y = auc, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "AUC", title = "AUC vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot Best Threshold vs. p
+ggplot(model_results, aes(x = p, y = threshold, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Best Threshold", title = "Best Threshold vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+par(mfrow = c(1, 1))
+```
+
+## See the performance only on specific race test data on balanced train and test data set.
+
+-   There is one thing that may differ from the other part here is that in this part, we need a calibration test data set which I separate the original test data set into a half and half.
+
+Here is the code we randomly cut the test data in half. The calibration is called realtestdata, and the remain test one which we will use to get the AUC and best threshold is still called tesData_race_balanced.\
+
+```{r}
+# Split each race subgroup in testData_race_balanced into two halves
+
+realtestdata_list <- list()
+testData_race_balanced_list <- list()
+
+for (race in racial_subgroups) {
+  data_subgroup <- testData_race_balanced[testData_race_balanced$race == race,]
+  
+  # Randomly shuffle the rows and split the data into two
+  set.seed(42) # For reproducibility
+  shuffled_rows <- sample(1:nrow(data_subgroup))
+  half_point <- floor(nrow(data_subgroup) / 2)
+  
+  realtestdata_list[[race]] <- data_subgroup[shuffled_rows[1:half_point],]
+  testData_race_balanced_list[[race]] <- data_subgroup[shuffled_rows[(half_point + 1):nrow(data_subgroup)],]
+}
+
+# Combine the subgroups to form realtestdata and testData_race_balanced
+realtestdata_balanced <- do.call(rbind, realtestdata_list)
+testData_race_balanced <- do.call(rbind, testData_race_balanced_list)
+
+# Checking the distribution of the race in both datasets
+table(realtestdata_balanced$race)
+table(testData_race_balanced$race)
+
+
+```
+
+The AUC somehow increase because the test data is smaller. So we need some calibration to see the real accuracy (confusion matrix) from a new test data.
+
+```{r,message=FALSE, warning=FALSE}
+# Initialize an empty dataframe to store results
+model_results_combinations <- data.frame()
+model_results_combinations_real <- data.frame()
+
+# Iterate over racial subgroups for adding noise to training data
+for (race_train in racial_subgroups) {
+  
+  # Iterate over p values
+  for (p in p_values) {
+    
+    # Apply noise to the specific race in the training data
+    trainingData_race_balanced_with_noise <- add_noise_to_sub_race(trainingData_race_balanced, race_train, p)
+    
+    # Fit the logistic regression model
+    model <- glm(two_year_recid ~ ., family = binomial(link = 'logit'), data = trainingData_race_balanced_with_noise)
+    
+    # Iterate over racial subgroups for evaluating on test data
+    for (race_test in racial_subgroups) {
+      
+      # Subset the test data by the current race_test
+      testData_subgroup <- testData_race_balanced[testData_race_balanced$race == race_test,]
+      testData_subgroup_real <- realtestdata_balanced[realtestdata_balanced$race == race_test,]
+      
+      # Make predictions on the test data subgroup
+      probabilities <- predict(model, newdata = testData_subgroup, type = "response")
+      probabilities_real <- predict(model, newdata = testData_subgroup_real, type = "response")
+      
+      # Generate ROC curve
+      ### OLD CODE
+      #roc_obj <- roc(response = testData_subgroup$two_year_recid, predictor = probabilities)
+      #specificity <- coords(roc_obj, "best")$specificity
+      #sensitivity <- coords(roc_obj, "best")$sensitivity
+      
+      # Find the best threshold
+      #best_threshold <- coords(roc_obj, "best")$threshold
+      ### NEW CODE
+      roc_obj <- roc(response = testData_subgroup$two_year_recid, predictor = probabilities, levels = c(0,1), direction = "<")
+    specificity<-coords(roc_obj, "best")$specificity[1]
+    sensitivity<-coords(roc_obj, "best")$sensitivity[1]
+    # Find the best threshold
+    best_threshold <- coords(roc_obj, "best")$threshold[1]
+    ###
+      
+      # Classify predictions based on the best threshold
+      predictions <- ifelse(probabilities > best_threshold, 1, 0)
+      predictions_real <- ifelse(probabilities_real > best_threshold, 1, 0)
+      
+      # Calculate accuracy
+      cm <- confusionMatrix(factor(predictions), factor(testData_subgroup$two_year_recid))
+      best_accuracy <- sum(diag(cm$table)) / sum(cm$table)
+      
+      cm_real <- confusionMatrix(factor(predictions_real), factor(testData_subgroup_real$two_year_recid))
+      best_accuracy_real <- sum(diag(cm_real$table)) / sum(cm_real$table)
+      sensitivity_real <- cm_real$byClass["Sensitivity"]
+      specificity_real <- cm_real$byClass["Specificity"]
+
+      
+      # Store model results. test data (not calibration)
+      model_result <- data.frame(train_race_noise = race_train, p = p, test_race_eval = race_test, threshold = best_threshold, accuracy = best_accuracy, specificity = specificity, sensitivity = sensitivity, auc = auc(roc_obj))
+      model_results_combinations <- rbind(model_results_combinations, model_result)
+      # Store model results. test real data (calibration)
+      model_result_real <- data.frame(train_race_noise = race_train, p = p, test_race_eval = race_test, accuracy = best_accuracy_real, specificity = specificity_real, sensitivity = sensitivity_real)
+      model_results_combinations_real <- rbind(model_results_combinations_real, model_result_real)
+      
+      
+    }
+  }
+}
+
+```
+
+\
+Model results on test data not calibration:\
+
+```{r}
+# Define a helper function to create plots for a specific metric
+plot_combined_trainings <- function(data, metric, metric_column) {
+  p <- ggplot(data, aes_string(x = "p", y = metric_column, color = "test_race_eval")) +
+    geom_line() +
+    labs(x = "Proportion of Noise in Y", y = metric, 
+         title = paste(metric, "(Noise added on:", unique(data$train_race_noise), ")"), 
+         color = "Race of Test Data") +
+    theme_minimal() + theme(plot.title = element_text(size = 8))
+  
+  return(p)
+}
+
+# Metrics to iterate over
+metrics <- list("AUC", "Accuracy", "Sensitivity", "Specificity", "Best Threshold")
+metric_columns <- c("auc", "accuracy", "sensitivity", "specificity", "threshold")
+
+
+# Iterate over each metric and display the combined plots for all training races
+for(i in 1:length(metrics)) {
+  metric <- metrics[[i]]
+  metric_column <- metric_columns[[i]]
+  
+  for (train_race in racial_subgroups) {
+    subset_data <- model_results_combinations[model_results_combinations$train_race_noise == train_race,]
+    p <- plot_combined_trainings(subset_data, metric, metric_column)
+    
+    # Display the plot
+    print(p)
+  }
+}
+
+
+
+```
+
+Model results on real test data, A.K.A. calibration:\
+
+```{r}
+
+# Metrics to iterate over
+metrics <- list( "Accuracy", "Sensitivity", "Specificity")
+metric_columns <- c( "accuracy", "sensitivity", "specificity")
+
+
+# Iterate over each metric and display the combined plots for all training races
+for(i in 1:length(metrics)) {
+  metric <- metrics[[i]]
+  metric_column <- metric_columns[[i]]
+  
+  for (train_race in racial_subgroups) {
+    subset_data <- model_results_combinations_real[model_results_combinations$train_race_noise == train_race,]
+    p <- plot_combined_trainings(subset_data, metric, metric_column)
+    
+    # Display the plot
+    print(p)
+  }
+}
+
+
+
+```
+
+# Adding noise (Function D2 make 0 into 1) to different sub group
+This section is almost the same as the previous section. just change the noisy function.
+
+## Function to add noise to a specific sub-race
+
+```{r}
+# Function to add noise to a specific sub-race
+add_noise_to_sub_race <- function(data, race_to_add_noise, proportion) {
+  # Identify the rows corresponding to the selected race
+  race_rows <- which(data$race == race_to_add_noise)
+  
+  # Create a subset data frame for the selected race
+  subset_data <- data[race_rows,]
+  
+  # Apply the noisy_swap function to the subset data
+  
+  subset_data_with_noise <- reduce_positive_noise(subset_data, "two_year_recid",1, proportion) # change the positive parameter here 0 or 1
+  # noisy_swap(subset_data, "two_year_recid", proportion) # Function C's code
+  
+  # Replace the original rows with the noisy rows
+  data[race_rows,] <- subset_data_with_noise
+  
+  return(data)
+}
+```
+
+## Use LR model on original unbalanced test data:
+
+Here we use LR model to different sub races' adding noise.
+
+```{r,warning=FALSE, message=FALSE}
+# Get the unique racial subgroups
+racial_subgroups <- unique(trainingData$race)
+
+# Empty vectors to store results
+p_values <- seq(0, 100, 2)
+model_results <- data.frame()
+
+# Iterate over racial subgroups
+for (race_to_add_noise in racial_subgroups) {
+  # Iterate over p values
+  for (p in p_values) {
+    # Apply noise to the specific race in the training data
+    trainingData_with_noise <- add_noise_to_sub_race(trainingData, race_to_add_noise, p)
+    
+    # Fit the logistic regression model
+    model <- glm(two_year_recid ~ ., family = binomial(link = 'logit'), data = trainingData_with_noise)
+    
+    # Make predictions on the test data
+    probabilities <- predict(model, newdata = testData, type = "response")
+    
+    # Generate ROC curve
+    ### OLD CODE
+    #roc_obj <- roc(response = testData$two_year_recid, predictor = probabilities)
+    #specificity <- coords(roc_obj, "best")$specificity
+    #sensitivity <- coords(roc_obj, "best")$sensitivity
+    
+    # Find the best threshold
+    #best_threshold <- coords(roc_obj, "best")$threshold
+    ### NEW CODE
+    roc_obj <- roc(response = testData$two_year_recid, predictor = probabilities, levels = c(0,1), direction = "<")
+    specificity<-coords(roc_obj, "best")$specificity[1]
+    sensitivity<-coords(roc_obj, "best")$sensitivity[1]
+    # Find the best threshold
+    best_threshold <- coords(roc_obj, "best")$threshold[1]
+    
+    # Classify predictions based on the best threshold
+    predictions <- ifelse(probabilities > best_threshold, 1, 0)
+    
+    # Calculate accuracy
+    cm <- confusionMatrix(factor(predictions), factor(testData$two_year_recid))
+    best_accuracy <- sum(diag(cm$table)) / sum(cm$table)
+    
+    # Store model results
+    model_result <- data.frame(race = race_to_add_noise, p = p, threshold = best_threshold, accuracy = best_accuracy, specificity = specificity, sensitivity = sensitivity, auc = auc(roc_obj))
+    model_results <- rbind(model_results, model_result)
+  }
+}
+
+
+
+```
+
+Plot the changes in model_result:\
+
+```{r}
+# library(ggplot2)
+
+par(mfrow = c(2, 3))
+# Plot Accuracy vs. p
+ggplot(model_results, aes(x = p, y = accuracy, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Accuracy", title = "Accuracy vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot Sensitivity vs. p
+ggplot(model_results, aes(x = p, y = sensitivity, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Sensitivity", title = "Sensitivity vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot Specificity vs. p
+ggplot(model_results, aes(x = p, y = specificity, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Specificity", title = "Specificity vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot AUC vs. p
+ggplot(model_results, aes(x = p, y = auc, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "AUC", title = "AUC vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot Best Threshold vs. p
+ggplot(model_results, aes(x = p, y = threshold, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Best Threshold", title = "Best Threshold vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+par(mfrow = c(1, 1))
+
+```
+
+## Use LR model on SMOTE race balanced traing data:
+
+### Combine other races into Other
+
+Now for convenience we just consider three races: "Caucasian," "African-American," and "Others", and make these three balanced.
+
+```{r,warning=FALSE,message=FALSE}
+#library(DMwR) # Required for SMOTE function
+trainingData_newrace<-trainingData
+testData_newrace<-testData
+
+### Combine trainingData
+# Recode the 'race' variable to include only "Caucasian," "African-American," and "Others"
+trainingData_newrace$race <- ifelse(trainingData_newrace$race %in% c("Caucasian", "African-American"), as.character(trainingData_newrace$race), "Others")
+# Convert the 'race' variable to a factor
+trainingData_newrace$race <- as.factor(trainingData_newrace$race)
+table(trainingData_newrace$race)
+
+
+#### Combine test data
+testData_newrace <- testData
+testData_newrace$race <- ifelse(testData_newrace$race %in% c("Caucasian", "African-American"), as.character(testData_newrace$race), "Others")
+testData_newrace$race <- as.factor(testData_newrace$race)
+testData_newrace <- testData_newrace[testData_newrace$race != "Others", ]# Only keep black and white people
+
+```
+
+### Use SMOTE to balance the traing data by the 'race' variable
+
+```{r}
+# Split the data by race
+data_Caucasian <- trainingData_newrace[trainingData_newrace$race == "Caucasian",]
+data_African_American <- trainingData_newrace[trainingData_newrace$race == "African-American",]
+data_Others <- trainingData_newrace[trainingData_newrace$race == "Others",]
+
+# Find the maximum number of instances across the three race categories
+max_instances <- max(nrow(data_Caucasian), nrow(data_African_American), nrow(data_Others))
+
+# Oversample the minority classes
+set.seed(42) # For reproducibility
+data_Caucasian_balanced <- data_Caucasian[sample(1:nrow(data_Caucasian), max_instances, replace = TRUE),]
+data_African_American_balanced <- data_African_American[sample(1:nrow(data_African_American), max_instances, replace = TRUE),]
+data_Others_balanced <- data_Others[sample(1:nrow(data_Others), max_instances, replace = TRUE),]
+
+# Combine the balanced data back together
+trainingData_race_balanced <- rbind(data_Caucasian_balanced, data_African_American_balanced)
+
+
+# Check the distribution of the new 'race' variable in the balanced data
+table(trainingData_race_balanced$race)
+
+```
+
+Now the training data are balanced.
+
+### Rerun the code, adding noise to sub races
+
+```{r,warning=FALSE, message=FALSE}
+# Get the unique racial subgroups
+racial_subgroups <- unique(trainingData_race_balanced$race)
+
+# Empty vectors to store results
+p_values <- seq(0, 100, 2)
+model_results <- data.frame()
+
+# Iterate over racial subgroups
+for (race_to_add_noise in racial_subgroups) {
+  # Iterate over p values
+  for (p in p_values) {
+    # Apply noise to the specific race in the training data
+    trainingData_race_balanced_with_noise <- add_noise_to_sub_race(trainingData_race_balanced, race_to_add_noise, p)
+    
+    # Fit the logistic regression model
+    model <- glm(two_year_recid ~ ., family = binomial(link = 'logit'), data = trainingData_race_balanced_with_noise)
+    
+    # Make predictions on the test data
+    probabilities <- predict(model, newdata = testData_newrace, type = "response")
+    
+    # Generate ROC curve
+    ### OLD CODE
+    #roc_obj <- roc(response = testData_newrace$two_year_recid, predictor = probabilities)
+    #specificity <- coords(roc_obj, "best")$specificity
+    #sensitivity <- coords(roc_obj, "best")$sensitivity
+    
+    # Find the best threshold
+    #best_threshold <- coords(roc_obj, "best")$threshold
+    ### NEW CODE
+    roc_obj <- roc(response = testData_newrace$two_year_recid, predictor = probabilities, levels = c(0,1), direction = "<")
+    specificity<-coords(roc_obj, "best")$specificity[1]
+    sensitivity<-coords(roc_obj, "best")$sensitivity[1]
+    # Find the best threshold
+    best_threshold <- coords(roc_obj, "best")$threshold[1]
+    
+    # Classify predictions based on the best threshold
+    predictions <- ifelse(probabilities > best_threshold, 1, 0)
+    
+    # Calculate accuracy
+    cm <- confusionMatrix(factor(predictions), factor(testData_newrace$two_year_recid))
+    best_accuracy <- sum(diag(cm$table)) / sum(cm$table)
+    
+    # Store model results
+    model_result <- data.frame(race = race_to_add_noise, p = p, threshold = best_threshold, accuracy = best_accuracy, specificity = specificity, sensitivity = sensitivity, auc = auc(roc_obj))
+    model_results <- rbind(model_results, model_result)
+  }
+}
+
+```
+
+Plot the changes in model_result:\
+
+```{r}
+# library(ggplot2)
+
+par(mfrow = c(2, 3))
+# Plot Accuracy vs. p
+ggplot(model_results, aes(x = p, y = accuracy, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Accuracy", title = "Accuracy vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot Sensitivity vs. p
+ggplot(model_results, aes(x = p, y = sensitivity, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Sensitivity", title = "Sensitivity vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot Specificity vs. p
+ggplot(model_results, aes(x = p, y = specificity, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Specificity", title = "Specificity vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot AUC vs. p
+ggplot(model_results, aes(x = p, y = auc, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "AUC", title = "AUC vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot Best Threshold vs. p
+ggplot(model_results, aes(x = p, y = threshold, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Best Threshold", title = "Best Threshold vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+par(mfrow = c(1, 1))
+```
+
+### Balanced training data and balanced test data.
+
+There are some worries of the unbalance on the test data that may lead to a biased interpretation on the model results and fairness. In order to deal with this, we use smote to balanced the race on the test data and consider the sub races (Caucassian, African-American and Others) all equally.\
+
+## Use SMOTE to balance the train and test data by the 'race' variable
+
+```{r}
+# Split the data by race
+data_Caucasian <- testData_newrace[testData_newrace$race == "Caucasian",]
+data_African_American <- testData_newrace[testData_newrace$race == "African-American",]
+data_Others <- testData_newrace[testData_newrace$race == "Others",]
+
+# Find the maximum number of instances across the three race categories
+max_instances <- max(nrow(data_Caucasian), nrow(data_African_American), nrow(data_Others))
+
+# Oversample the minority classes
+set.seed(42) # For reproducibility
+data_Caucasian_balanced <- data_Caucasian[sample(1:nrow(data_Caucasian), max_instances, replace = TRUE),]
+data_African_American_balanced <- data_African_American[sample(1:nrow(data_African_American), max_instances, replace = TRUE),]
+data_Others_balanced <- data_Others[sample(1:nrow(data_Others), max_instances, replace = TRUE),]
+
+# Combine the balanced data back together
+testData_race_balanced <- rbind(data_Caucasian_balanced, data_African_American_balanced)
+
+# Check the distribution of the new 'race' variable in the balanced data
+table(testData_race_balanced$race)
+```
+
+Now the test data are balanced.
+
+### Rerun the code, adding noise to sub races
+
+```{r,warning=FALSE, message=FALSE}
+# Get the unique racial subgroups
+racial_subgroups <- unique(trainingData_race_balanced$race)
+
+# Empty vectors to store results
+p_values <- seq(0, 100, 2)
+model_results <- data.frame()
+
+# Iterate over racial subgroups
+for (race_to_add_noise in racial_subgroups) {
+  # Iterate over p values
+  for (p in p_values) {
+    # Apply noise to the specific race in the training data
+    trainingData_race_balanced_with_noise <- add_noise_to_sub_race(trainingData_race_balanced, race_to_add_noise, p)
+    
+    # Fit the logistic regression model
+    model <- glm(two_year_recid ~ ., family = binomial(link = 'logit'), data = trainingData_race_balanced_with_noise)
+    
+    # Make predictions on the test data
+    probabilities <- predict(model, newdata = testData_race_balanced, type = "response")
+    
+    # Generate ROC curve
+    ### OLD CODE
+    #roc_obj <- roc(response = testData_race_balanced$two_year_recid, predictor = probabilities)
+    #specificity <- coords(roc_obj, "best")$specificity
+    #sensitivity <- coords(roc_obj, "best")$sensitivity
+    
+    # Find the best threshold
+    #best_threshold <- coords(roc_obj, "best")$threshold
+    ### NEW CODE
+    roc_obj <- roc(response = testData_race_balanced$two_year_recid, predictor = probabilities, levels = c(0,1), direction = "<")
+    specificity<-coords(roc_obj, "best")$specificity[1]
+    sensitivity<-coords(roc_obj, "best")$sensitivity[1]
+    # Find the best threshold
+    best_threshold <- coords(roc_obj, "best")$threshold[1]
+    
+    # Classify predictions based on the best threshold
+    predictions <- ifelse(probabilities > best_threshold, 1, 0)
+    
+    # Calculate accuracy
+    cm <- confusionMatrix(factor(predictions), factor(testData_race_balanced$two_year_recid))
+    best_accuracy <- sum(diag(cm$table)) / sum(cm$table)
+    
+    # Store model results
+    model_result <- data.frame(race = race_to_add_noise, p = p, threshold = best_threshold, accuracy = best_accuracy, specificity = specificity, sensitivity = sensitivity, auc = auc(roc_obj))
+    model_results <- rbind(model_results, model_result)
+  }
+}
+
+```
+
+Plot the changes in model_result:\
+
+```{r}
+# library(ggplot2)
+
+par(mfrow = c(2, 3))
+# Plot Accuracy vs. p
+ggplot(model_results, aes(x = p, y = accuracy, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Accuracy", title = "Accuracy vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot Sensitivity vs. p
+ggplot(model_results, aes(x = p, y = sensitivity, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Sensitivity", title = "Sensitivity vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot Specificity vs. p
+ggplot(model_results, aes(x = p, y = specificity, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Specificity", title = "Specificity vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot AUC vs. p
+ggplot(model_results, aes(x = p, y = auc, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "AUC", title = "AUC vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+# Plot Best Threshold vs. p
+ggplot(model_results, aes(x = p, y = threshold, color = race)) +
+  geom_line() +
+  labs(x = "Proportion of Noise in Y", y = "Best Threshold", title = "Best Threshold vs. p") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.title = element_blank())
+
+par(mfrow = c(1, 1))
+```
+
+## See the performance only on specific race test data on balanced train and test data set.
+
+-   There is one thing that may differ from the other part here is that in this part, we need a calibration test data set which I separate the original test data set into a half and half.
+
+Here is the code we randomly cut the test data in half. The calibration is called realtestdata, and the remain test one which we will use to get the AUC and best threshold is still called tesData_race_balanced.\
+
+```{r}
+# Split each race subgroup in testData_race_balanced into two halves
+
+realtestdata_list <- list()
+testData_race_balanced_list <- list()
+
+for (race in racial_subgroups) {
+  data_subgroup <- testData_race_balanced[testData_race_balanced$race == race,]
+  
+  # Randomly shuffle the rows and split the data into two
+  set.seed(42) # For reproducibility
+  shuffled_rows <- sample(1:nrow(data_subgroup))
+  half_point <- floor(nrow(data_subgroup) / 2)
+  
+  realtestdata_list[[race]] <- data_subgroup[shuffled_rows[1:half_point],]
+  testData_race_balanced_list[[race]] <- data_subgroup[shuffled_rows[(half_point + 1):nrow(data_subgroup)],]
+}
+
+# Combine the subgroups to form realtestdata and testData_race_balanced
+realtestdata_balanced <- do.call(rbind, realtestdata_list)
+testData_race_balanced <- do.call(rbind, testData_race_balanced_list)
+
+# Checking the distribution of the race in both datasets
+table(realtestdata_balanced$race)
+table(testData_race_balanced$race)
+
+
+```
+
+The AUC somehow increase because the test data is smaller. So we need some calibration to see the real accuracy (confusion matrix) from a new test data.
+
+```{r,message=FALSE, warning=FALSE}
+# Initialize an empty dataframe to store results
+model_results_combinations <- data.frame()
+model_results_combinations_real <- data.frame()
+
+# Iterate over racial subgroups for adding noise to training data
+for (race_train in racial_subgroups) {
+  
+  # Iterate over p values
+  for (p in p_values) {
+    
+    # Apply noise to the specific race in the training data
+    trainingData_race_balanced_with_noise <- add_noise_to_sub_race(trainingData_race_balanced, race_train, p)
+    
+    # Fit the logistic regression model
+    model <- glm(two_year_recid ~ ., family = binomial(link = 'logit'), data = trainingData_race_balanced_with_noise)
+    
+    # Iterate over racial subgroups for evaluating on test data
+    for (race_test in racial_subgroups) {
+      
+      # Subset the test data by the current race_test
+      testData_subgroup <- testData_race_balanced[testData_race_balanced$race == race_test,]
+      testData_subgroup_real <- realtestdata_balanced[realtestdata_balanced$race == race_test,]
+      
+      # Make predictions on the test data subgroup
+      probabilities <- predict(model, newdata = testData_subgroup, type = "response")
+      probabilities_real <- predict(model, newdata = testData_subgroup_real, type = "response")
+      
+      # Generate ROC curve
+      ### OLD CODE
+      #roc_obj <- roc(response = testData_subgroup$two_year_recid, predictor = probabilities)
+      #specificity <- coords(roc_obj, "best")$specificity
+      #sensitivity <- coords(roc_obj, "best")$sensitivity
+      
+      # Find the best threshold
+      #best_threshold <- coords(roc_obj, "best")$threshold
+      ### NEW CODE
+      roc_obj <- roc(response = testData_subgroup$two_year_recid, predictor = probabilities, levels = c(0,1), direction = "<")
+    specificity<-coords(roc_obj, "best")$specificity[1]
+    sensitivity<-coords(roc_obj, "best")$sensitivity[1]
+    # Find the best threshold
+    best_threshold <- coords(roc_obj, "best")$threshold[1]
+    ###
+      
+      # Classify predictions based on the best threshold
+      predictions <- ifelse(probabilities > best_threshold, 1, 0)
+      predictions_real <- ifelse(probabilities_real > best_threshold, 1, 0)
+      
+      # Calculate accuracy
+      cm <- confusionMatrix(factor(predictions), factor(testData_subgroup$two_year_recid))
+      best_accuracy <- sum(diag(cm$table)) / sum(cm$table)
+      
+      cm_real <- confusionMatrix(factor(predictions_real), factor(testData_subgroup_real$two_year_recid))
+      best_accuracy_real <- sum(diag(cm_real$table)) / sum(cm_real$table)
+      sensitivity_real <- cm_real$byClass["Sensitivity"]
+      specificity_real <- cm_real$byClass["Specificity"]
+
+      
+      # Store model results. test data (not calibration)
+      model_result <- data.frame(train_race_noise = race_train, p = p, test_race_eval = race_test, threshold = best_threshold, accuracy = best_accuracy, specificity = specificity, sensitivity = sensitivity, auc = auc(roc_obj))
+      model_results_combinations <- rbind(model_results_combinations, model_result)
+      # Store model results. test real data (calibration)
+      model_result_real <- data.frame(train_race_noise = race_train, p = p, test_race_eval = race_test, accuracy = best_accuracy_real, specificity = specificity_real, sensitivity = sensitivity_real)
+      model_results_combinations_real <- rbind(model_results_combinations_real, model_result_real)
+      
+      
+    }
+  }
+}
+
+```
+
+\
+Model results on test data not calibration:\
+
+```{r}
+# Define a helper function to create plots for a specific metric
+plot_combined_trainings <- function(data, metric, metric_column) {
+  p <- ggplot(data, aes_string(x = "p", y = metric_column, color = "test_race_eval")) +
+    geom_line() +
+    labs(x = "Proportion of Noise in Y", y = metric, 
+         title = paste(metric, "(Noise added on:", unique(data$train_race_noise), ")"), 
+         color = "Race of Test Data") +
+    theme_minimal() + theme(plot.title = element_text(size = 8))
+  
+  return(p)
+}
+
+# Metrics to iterate over
+metrics <- list("AUC", "Accuracy", "Sensitivity", "Specificity", "Best Threshold")
+metric_columns <- c("auc", "accuracy", "sensitivity", "specificity", "threshold")
+
+
+# Iterate over each metric and display the combined plots for all training races
+for(i in 1:length(metrics)) {
+  metric <- metrics[[i]]
+  metric_column <- metric_columns[[i]]
+  
+  for (train_race in racial_subgroups) {
+    subset_data <- model_results_combinations[model_results_combinations$train_race_noise == train_race,]
+    p <- plot_combined_trainings(subset_data, metric, metric_column)
+    
+    # Display the plot
+    print(p)
+  }
+}
+
+
+
+```
+
+Model results on real test data, A.K.A. calibration:\
+
+```{r}
+
+# Metrics to iterate over
+metrics <- list( "Accuracy", "Sensitivity", "Specificity")
+metric_columns <- c( "accuracy", "sensitivity", "specificity")
+
+
+# Iterate over each metric and display the combined plots for all training races
+for(i in 1:length(metrics)) {
+  metric <- metrics[[i]]
+  metric_column <- metric_columns[[i]]
+  
+  for (train_race in racial_subgroups) {
+    subset_data <- model_results_combinations_real[model_results_combinations$train_race_noise == train_race,]
+    p <- plot_combined_trainings(subset_data, metric, metric_column)
+    
+    # Display the plot
+    print(p)
+  }
+}
+
+
+
+```
+
